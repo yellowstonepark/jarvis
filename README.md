@@ -37,7 +37,26 @@ Run the Mac mini receiver prototype:
 PYTHONPATH=src python3 -m jarvis.mac_mini.server --host MAC_MINI_TAILSCALE_IP --port 8765
 ```
 
-By default, received window events are appended to:
+The Mac mini receiver also exposes `POST /v1/ask`, which streams responses from local Ollama. It defaults to `gemma4.e4b` with Ollama `think: false` and temperature `0`:
+
+```sh
+ollama pull gemma4.e4b
+uv run jarvis-mini --host 100.110.15.28 --port 8765 --ollama-model gemma4.e4b
+```
+
+Ask Jarvis from the MacBook:
+
+```sh
+jarvis ask "what is the fastest way to test this?"
+```
+
+If `~/.jarvis/receiver-url` is not configured, pass the ask endpoint explicitly:
+
+```sh
+jarvis ask --ask-url http://100.110.15.28:8765/v1/ask "what is the fastest way to test this?"
+```
+
+By default, received window events are appended on the Mac mini to:
 
 ```sh
 ~/.jarvis/window-events.jsonl
@@ -60,6 +79,12 @@ Configure the MacBook `Jarvis.app` to stream to the Mac mini:
 ```sh
 mkdir -p ~/.jarvis
 printf "%s\n" "http://MAC_MINI_TAILSCALE_NAME:8765/v1/window/events" > ~/.jarvis/receiver-url
+```
+
+If the Mac mini is unreachable, the MacBook CLI/app queues unsent events here and flushes them later in order:
+
+```sh
+~/.jarvis/window-outbox.jsonl
 ```
 
 Build the dedicated macOS app:

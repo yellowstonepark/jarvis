@@ -34,6 +34,9 @@ It currently exposes:
 - `GET /health`
 - `POST /v1/window/events`
 - `GET /v1/window/latest`
+- `POST /v1/ask`
+
+`POST /v1/ask` proxies a prompt to local Ollama via `/api/chat` and streams plain text back to the caller. It is intentionally not connected to `window-events.jsonl` yet. The default Ollama request uses `model: gemma4.e4b`, `think: false`, `stream: true`, and `temperature: 0`.
 
 ## Communication Direction
 
@@ -42,7 +45,8 @@ The clean default is agent-to-mini push:
 1. The observed Mac runs `jarvis`.
 2. It reads local context, such as the active window.
 3. It sends small JSON events to the Mac mini over Tailscale with `--send-to http://<mac-mini-tailscale-name>:8765/v1/window/events`, or the MacBook app reads the same receiver endpoint from `~/.jarvis/receiver-url`.
-4. The Mac mini stores the latest event in memory and appends all received events to JSONL for later context.
+4. If the Mac mini is unreachable, the Mac agent queues unsent events at `~/.jarvis/window-outbox.jsonl` and retries later.
+5. The Mac mini stores the latest event in memory and appends all received events to JSONL for later context.
 
 This keeps macOS permissions local to the machine being observed. The Mac mini
 does not need Accessibility permission for another Mac.

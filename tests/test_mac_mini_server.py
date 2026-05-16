@@ -1,10 +1,11 @@
 import json
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from jarvis.common.models import WindowSnapshot
-from jarvis.mac_mini.server import State
+from jarvis.mac_mini.server import OllamaConfig, State, open_ollama_chat
 
 
 class StateTests(unittest.TestCase):
@@ -25,6 +26,24 @@ class StateTests(unittest.TestCase):
             lines = event_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 1)
             self.assertEqual(json.loads(lines[0]), json.loads(snapshot.to_json()))
+
+
+class OllamaChatTests(unittest.TestCase):
+    @unittest.mock.patch("jarvis.mac_mini.server.urlopen")
+    def test_open_ollama_chat_disables_thinking(self, mock_urlopen) -> None:
+        config = OllamaConfig("http://127.0.0.1:11434", "gemma4.e4b", 12.0)
+
+        open_ollama_chat("hello", config)
+
+        request = mock_urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(request.full_url, "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(payload["model"], "gemma4.e4b")
+        self.assertEqual(payload["messages"], [{"role": "user", "content": "hello"}])
+        self.assertIs(payload["stream"], True)
+        self.assertIs(payload["think"], False)
+        self.assertEqual(payload["options"]["temperature"], 0)
+        self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], 12.0)
 
 
 if __name__ == "__main__":

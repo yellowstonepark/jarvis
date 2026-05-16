@@ -1,13 +1,31 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import threading
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from jarvis.common.models import WindowSnapshot
+
+
+class OllamaChatError(Exception):
+    """Raised when the Mac mini cannot stream a response from Ollama."""
+
+
+@dataclass(frozen=True)
+class OllamaConfig:
+    base_url: str
+    model: str
+    timeout: float
+
+    @property
+    def chat_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/api/chat"
 
 
 class State:
@@ -36,7 +54,7 @@ class State:
             file.write("\n")
 
 
-def build_handler(state: State):
+def build_handler(state: State, ollama: OllamaConfig):
     class JarvisMiniHandler(BaseHTTPRequestHandler):
         server_version = "JarvisMini/0.1"
 
@@ -56,10 +74,17 @@ def build_handler(state: State):
             self.write_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
         def do_POST(self) -> None:
-            if self.path != "/v1/window/events":
-                self.write_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            if self.path == "/v1/window/events":
+                self.handle_window_event()
                 return
 
+            if self.path == "/v1/ask":
+                self.handle_ask()
+                return
+
+            self.write_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+
+        def handle_window_event(self) -> None:
             length = int(self.headers.get("content-length", "0"))
             raw_body = self.rfile.read(length).decode("utf-8")
 
@@ -75,6 +100,36 @@ def build_handler(state: State):
             state.set_latest_window(snapshot)
             self.write_json(HTTPStatus.ACCEPTED, {"ok": True})
 
+        def handle_ask(self) -> None:
+            length = int(self.headers.get("content-length", "0"))
+            raw_body = self.rfile.read(length).decode("utf-8")
+
+            try:
+                payload = json.loads(raw_body)
+                prompt = payload["prompt"]
+            except (KeyError, TypeError, json.JSONDecodeError) as error:
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid ask payload: {error}"})
+                return
+
+            if not isinstance(prompt, str) or not prompt.strip():
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "prompt must be a non-empty string"})
+                return
+
+            try:
+                ollama_response = open_ollama_chat(prompt, ollama)
+            except OllamaChatError as error:
+                self.write_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                return
+
+            with ollama_response:
+                self.send_response(HTTPStatus.OK)
+                self.send_header("content-type", "text/plain; charset=utf-8")
+                self.end_headers()
+
+                for chunk in iter_ollama_content(ollama_response):
+                    self.wfile.write(chunk.encode("utf-8"))
+                    self.wfile.flush()
+
         def log_message(self, format: str, *args) -> None:
             return
 
@@ -87,6 +142,50 @@ def build_handler(state: State):
             self.wfile.write(body)
 
     return JarvisMiniHandler
+
+
+
+def open_ollama_chat(prompt: str, config: OllamaConfig):
+    payload = {
+        "model": config.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+        "think": False,
+        "keep_alive": "30m",
+        "options": {"temperature": 0},
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = Request(
+        config.chat_url,
+        data=body,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        return urlopen(request, timeout=config.timeout)
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise OllamaChatError(f"ollama returned HTTP {error.code}: {detail}") from error
+    except URLError as error:
+        raise OllamaChatError(f"could not reach ollama: {error.reason}") from error
+    except TimeoutError as error:
+        raise OllamaChatError("timed out connecting to ollama") from error
+
+
+def iter_ollama_content(response):
+    for raw_line in response:
+        line = raw_line.decode("utf-8").strip()
+        if not line:
+            continue
+
+        payload = json.loads(line)
+        if "error" in payload:
+            raise OllamaChatError(str(payload["error"]))
+
+        content = payload.get("message", {}).get("content")
+        if content:
+            yield content
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -102,16 +201,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("~/.jarvis/window-events.jsonl"),
         help="Path for newline-delimited window events. Default: ~/.jarvis/window-events.jsonl.",
     )
+    parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
+    parser.add_argument("--ollama-model", default="gemma4.e4b")
+    parser.add_argument(
+        "--ollama-timeout",
+        type=float,
+        default=30.0,
+        help="Ollama connection timeout in seconds. Default: 30.0.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     state = State(args.event_log)
-    server = ThreadingHTTPServer((args.host, args.port), build_handler(state))
+    ollama = OllamaConfig(args.ollama_url, args.ollama_model, args.ollama_timeout)
+    server = ThreadingHTTPServer((args.host, args.port), build_handler(state, ollama))
 
     print(f"jarvis-mini listening on http://{args.host}:{args.port}", flush=True)
     print(f"writing window events to {state.event_log}", flush=True)
+    print(f"ollama chat model {ollama.model} via {ollama.chat_url}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

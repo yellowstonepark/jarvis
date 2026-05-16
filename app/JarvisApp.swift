@@ -17,6 +17,7 @@ let logFile = logDirectory.appendingPathComponent("jarvis.log")
 let configDirectory = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".jarvis")
 let receiverURLFile = configDirectory.appendingPathComponent("receiver-url")
+let outboxFile = configDirectory.appendingPathComponent("window-outbox.jsonl")
 let encoder = JSONEncoder()
 let dateFormatter = ISO8601DateFormatter()
 
@@ -112,21 +113,141 @@ func sendSnapshot(_ data: Data) {
         return
     }
 
+    flushOutbox(to: receiverURL) { flushed in
+        postSnapshot(data, to: receiverURL) { success in
+            if success {
+                if flushed > 0 {
+                    log("send_flushed \(flushed)")
+                }
+            } else {
+                appendToOutbox(data)
+            }
+        }
+    }
+}
+
+func flushOutbox(to receiverURL: URL, completion: @escaping (Int) -> Void) {
+    let queuedEvents = readOutbox()
+    if queuedEvents.isEmpty {
+        completion(0)
+        return
+    }
+
+    sendQueuedEvents(queuedEvents, index: 0, sent: 0, to: receiverURL, completion: completion)
+}
+
+func sendQueuedEvents(
+    _ events: [Data],
+    index: Int,
+    sent: Int,
+    to receiverURL: URL,
+    completion: @escaping (Int) -> Void
+) {
+    if index >= events.count {
+        clearOutbox()
+        completion(sent)
+        return
+    }
+
+    postSnapshot(events[index], to: receiverURL) { success in
+        if success {
+            sendQueuedEvents(events, index: index + 1, sent: sent + 1, to: receiverURL, completion: completion)
+            return
+        }
+
+        replaceOutbox(Array(events[index...]))
+        completion(sent)
+    }
+}
+
+func postSnapshot(_ data: Data, to receiverURL: URL, completion: @escaping (Bool) -> Void) {
     var request = URLRequest(url: receiverURL)
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "content-type")
     request.httpBody = data
+    request.timeoutInterval = 3
 
     URLSession.shared.dataTask(with: request) { _, response, error in
         if let error {
             log("send_error \(error)")
+            completion(false)
             return
         }
 
         if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode >= 400 {
             log("send_error HTTP \(httpResponse.statusCode)")
+            completion(false)
+            return
         }
+
+        completion(true)
     }.resume()
+}
+
+func appendToOutbox(_ data: Data) {
+    do {
+        try FileManager.default.createDirectory(
+            at: configDirectory,
+            withIntermediateDirectories: true
+        )
+
+        var line = data
+        line.append(Data("\n".utf8))
+
+        if FileManager.default.fileExists(atPath: outboxFile.path) {
+            let handle = try FileHandle(forWritingTo: outboxFile)
+            try handle.seekToEnd()
+            try handle.write(contentsOf: line)
+            try handle.close()
+        } else {
+            try line.write(to: outboxFile)
+        }
+    } catch {
+        log("outbox_append_error \(error)")
+    }
+}
+
+func readOutbox() -> [Data] {
+    guard let contents = try? String(contentsOf: outboxFile, encoding: .utf8) else {
+        return []
+    }
+
+    return contents
+        .split(separator: "\n")
+        .compactMap { String($0).data(using: .utf8) }
+}
+
+func replaceOutbox(_ events: [Data]) {
+    if events.isEmpty {
+        clearOutbox()
+        return
+    }
+
+    do {
+        try FileManager.default.createDirectory(
+            at: configDirectory,
+            withIntermediateDirectories: true
+        )
+
+        var data = Data()
+        for event in events {
+            data.append(event)
+            data.append(Data("\n".utf8))
+        }
+        try data.write(to: outboxFile)
+    } catch {
+        log("outbox_replace_error \(error)")
+    }
+}
+
+func clearOutbox() {
+    do {
+        if FileManager.default.fileExists(atPath: outboxFile.path) {
+            try FileManager.default.removeItem(at: outboxFile)
+        }
+    } catch {
+        log("outbox_clear_error \(error)")
+    }
 }
 
 func configuredReceiverURL() -> URL? {

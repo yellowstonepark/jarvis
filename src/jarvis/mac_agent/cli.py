@@ -4,7 +4,13 @@ import argparse
 import sys
 import time
 
-from jarvis.mac_agent.client import WindowEventClient, WindowEventSendError
+from jarvis.mac_agent.client import (
+    AskClient,
+    AskStreamError,
+    WindowEventClient,
+    WindowEventSendError,
+    default_receiver_endpoint,
+)
 from jarvis.mac_agent.window import ActiveWindowError, get_active_window
 
 
@@ -48,7 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_args = sys.argv[1:] if argv is None else argv
+    if raw_args and raw_args[0] == "ask":
+        return ask(raw_args[1:])
+
+    args = build_parser().parse_args(raw_args)
 
     if args.interval <= 0:
         print("--interval must be greater than 0.", file=sys.stderr)
@@ -70,6 +80,52 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except ActiveWindowError as error:
         print(format_error(error), file=sys.stderr)
+        return 1
+
+
+def ask(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="jarvis ask",
+        description="Ask the Mac mini Jarvis receiver and stream the response.",
+    )
+    parser.add_argument("prompt", nargs="+", help="Prompt to send to Jarvis.")
+    parser.add_argument(
+        "--ask-url",
+        help="Jarvis ask endpoint. Defaults to JARVIS_ASK_URL or ~/.jarvis/receiver-url converted to /v1/ask.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="Receiver timeout in seconds. Default: 60.0.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.timeout <= 0:
+        print("--timeout must be greater than 0.", file=sys.stderr)
+        return 2
+
+    endpoint = args.ask_url or default_receiver_endpoint()
+    if endpoint is None:
+        print(
+            "No Jarvis ask endpoint configured. Set ~/.jarvis/receiver-url or pass --ask-url.",
+            file=sys.stderr,
+        )
+        return 2
+
+    prompt = " ".join(args.prompt)
+    client = AskClient(endpoint, args.timeout)
+
+    def write_stream(chunk: str) -> None:
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+
+    try:
+        client.stream(prompt, write_stream)
+        print(flush=True)
+        return 0
+    except AskStreamError as error:
+        print(f"failed to ask Jarvis: {error}", file=sys.stderr)
         return 1
 
 
