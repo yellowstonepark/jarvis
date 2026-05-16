@@ -12,6 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from jarvis.common.models import WindowSnapshot
+from jarvis.mac_mini.memory import MemoryStore, format_session_context, render_recap
 
 
 class OllamaChatError(Exception):
@@ -30,10 +31,12 @@ class OllamaConfig:
 
 
 class State:
-    def __init__(self, event_log: Path) -> None:
+    def __init__(self, event_log: Path, db_path: Path) -> None:
         self._lock = threading.Lock()
         self._latest_window: WindowSnapshot | None = None
         self._event_log = event_log.expanduser()
+        self._memory = MemoryStore(db_path)
+        self._memory.ingest_jsonl(self._event_log)
 
     def set_latest_window(self, snapshot: WindowSnapshot) -> None:
         with self._lock:
@@ -48,39 +51,37 @@ class State:
     def event_log(self) -> Path:
         return self._event_log
 
+    @property
+    def db_path(self) -> Path:
+        return self._memory.path
+
     def recent_window_events(
         self,
         minutes: float,
     ) -> list[WindowSnapshot]:
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
-
         with self._lock:
-            if not self._event_log.exists():
-                return []
+            return self._memory.recent_window_events(minutes)
 
-            events: list[WindowSnapshot] = []
-            with self._event_log.open(encoding="utf-8") as file:
-                for line in file:
-                    line = line.strip()
-                    if not line:
-                        continue
+    def recap(self, minutes: float) -> str:
+        end_at = datetime.now(timezone.utc)
+        start_at = end_at - timedelta(minutes=minutes)
+        with self._lock:
+            sessions = self._memory.build_sessions(start_at, end_at)
+        return render_recap(sessions)
 
-                    try:
-                        snapshot = WindowSnapshot.from_json(line)
-                        observed_at = parse_timestamp(snapshot.observed_at)
-                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                        continue
-
-                    if observed_at >= cutoff:
-                        events.append(snapshot)
-
-        return events
+    def recent_session_context(self, minutes: float) -> str:
+        end_at = datetime.now(timezone.utc)
+        start_at = end_at - timedelta(minutes=minutes)
+        with self._lock:
+            sessions = self._memory.build_sessions(start_at, end_at)
+        return format_session_context(sessions)
 
     def _append_event(self, snapshot: WindowSnapshot) -> None:
         self._event_log.parent.mkdir(parents=True, exist_ok=True)
         with self._event_log.open("a", encoding="utf-8") as file:
             file.write(snapshot.to_json())
             file.write("\n")
+        self._memory.insert_window_event(snapshot)
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -119,6 +120,10 @@ def build_handler(state: State, ollama: OllamaConfig):
                 self.handle_ask()
                 return
 
+            if self.path == "/v1/recap":
+                self.handle_recap()
+                return
+
             self.write_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
         def handle_window_event(self) -> None:
@@ -136,6 +141,23 @@ def build_handler(state: State, ollama: OllamaConfig):
 
             state.set_latest_window(snapshot)
             self.write_json(HTTPStatus.ACCEPTED, {"ok": True})
+
+        def handle_recap(self) -> None:
+            length = int(self.headers.get("content-length", "0"))
+            raw_body = self.rfile.read(length).decode("utf-8")
+
+            try:
+                payload = json.loads(raw_body) if raw_body else {}
+                minutes = float(payload.get("minutes", 120))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid recap payload: {error}"})
+                return
+
+            if minutes <= 0:
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "minutes must be greater than 0"})
+                return
+
+            self.write_json(HTTPStatus.OK, {"recap": state.recap(minutes)})
 
         def handle_ask(self) -> None:
             length = int(self.headers.get("content-length", "0"))
@@ -169,7 +191,14 @@ def build_handler(state: State, ollama: OllamaConfig):
 
             if with_window_history:
                 events = state.recent_window_events(history_minutes)
-                prompt = build_ask_prompt(prompt, events, history_minutes, max_history_events)
+                session_context = state.recent_session_context(history_minutes)
+                prompt = build_ask_prompt(
+                    prompt,
+                    events,
+                    history_minutes,
+                    max_history_events,
+                    session_context,
+                )
 
             try:
                 ollama_response = open_ollama_chat(prompt, ollama)
@@ -207,18 +236,24 @@ def build_ask_prompt(
     events: list[WindowSnapshot],
     history_minutes: float,
     max_segments: int = 80,
+    session_context: str = "",
 ) -> str:
     timeline = format_window_timeline(events, max_segments)
     if not timeline:
         timeline = "- No recent window events were recorded."
 
+    if not session_context:
+        session_context = "- No session summaries are available yet."
+
     return (
         "You are Jarvis, a concise local assistant. Answer the user using only "
-        "the recent window timeline below when the question asks about activity, "
-        "focus, apps, projects, or recent work. If the timeline is insufficient, "
-        "say what is missing. Do not invent details.\n\n"
+        "the session summaries and recent window timeline below when the question "
+        "asks about activity, focus, apps, projects, or recent work. Prefer "
+        "session summaries for higher-level answers and raw events for details. "
+        "If the context is insufficient, say what is missing. Do not invent details.\n\n"
         f"User question:\n{question.strip()}\n\n"
-        f"Recent window timeline, last {history_minutes:g} minutes:\n{timeline}\n\n"
+        f"Recent session summaries, last {history_minutes:g} minutes:\n{session_context}\n\n"
+        f"Recent raw window timeline, last {history_minutes:g} minutes:\n{timeline}\n\n"
         "Answer concisely."
     )
 
@@ -318,6 +353,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("~/.jarvis/window-events.jsonl"),
         help="Path for newline-delimited window events. Default: ~/.jarvis/window-events.jsonl.",
     )
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=Path("~/.jarvis/jarvis.sqlite"),
+        help="Path for SQLite memory store. Default: ~/.jarvis/jarvis.sqlite.",
+    )
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--ollama-model", default="gemma4.e4b")
     parser.add_argument(
@@ -331,12 +372,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    state = State(args.event_log)
+    state = State(args.event_log, args.db_path)
     ollama = OllamaConfig(args.ollama_url, args.ollama_model, args.ollama_timeout)
     server = ThreadingHTTPServer((args.host, args.port), build_handler(state, ollama))
 
     print(f"jarvis-mini listening on http://{args.host}:{args.port}", flush=True)
     print(f"writing window events to {state.event_log}", flush=True)
+    print(f"writing memory database to {state.db_path}", flush=True)
     print(f"ollama chat model {ollama.model} via {ollama.chat_url}", flush=True)
     try:
         server.serve_forever()

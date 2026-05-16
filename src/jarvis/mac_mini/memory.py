@@ -1,0 +1,384 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+import sqlite3
+
+from jarvis.common.models import WindowSnapshot
+
+
+@dataclass(frozen=True)
+class ActivitySession:
+    start_at: str
+    end_at: str
+    label: str
+    summary: str
+    event_count: int
+    confidence: float
+
+
+def parse_timestamp(value: str) -> datetime:
+    normalized = value.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class MemoryStore:
+    def __init__(self, db_path: Path) -> None:
+        self.path = db_path.expanduser()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS window_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    observed_at TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    app_name TEXT NOT NULL,
+                    window_title TEXT,
+                    raw_json TEXT NOT NULL UNIQUE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_window_events_observed_at
+                ON window_events(observed_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_at TEXT NOT NULL,
+                    end_at TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    event_count INTEGER NOT NULL,
+                    confidence REAL NOT NULL,
+                    UNIQUE(start_at, end_at, label)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sessions_start_at
+                ON sessions(start_at)
+                """
+            )
+
+    def ingest_jsonl(self, path: Path) -> int:
+        expanded_path = path.expanduser()
+        if not expanded_path.exists():
+            return 0
+
+        inserted = 0
+        with expanded_path.open(encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    snapshot = WindowSnapshot.from_json(line)
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    continue
+                inserted += self.insert_window_event(snapshot)
+        return inserted
+
+    def insert_window_event(self, snapshot: WindowSnapshot) -> int:
+        raw_json = snapshot.to_json()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO window_events (
+                    observed_at, source, app_name, window_title, raw_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    parse_timestamp(snapshot.observed_at).isoformat(),
+                    snapshot.source,
+                    snapshot.app_name,
+                    snapshot.window_title,
+                    raw_json,
+                ),
+            )
+            return cursor.rowcount
+
+    def window_events_between(
+        self,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[WindowSnapshot]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT app_name, window_title, observed_at, source
+                FROM window_events
+                WHERE observed_at >= ? AND observed_at <= ?
+                ORDER BY observed_at ASC
+                """,
+                (start_at.isoformat(), end_at.isoformat()),
+            ).fetchall()
+
+        return [
+            WindowSnapshot(
+                app_name=row["app_name"],
+                window_title=row["window_title"],
+                observed_at=row["observed_at"],
+                source=row["source"],
+            )
+            for row in rows
+        ]
+
+    def recent_window_events(self, minutes: float) -> list[WindowSnapshot]:
+        end_at = utc_now()
+        return self.window_events_between(end_at - timedelta(minutes=minutes), end_at)
+
+    def build_sessions(
+        self,
+        start_at: datetime,
+        end_at: datetime,
+        gap_minutes: float = 8,
+    ) -> list[ActivitySession]:
+        events = self.window_events_between(start_at, end_at)
+        sessions = sessionize_events(events, gap_minutes=gap_minutes)
+        self.replace_sessions(sessions)
+        return sessions
+
+    def recent_sessions(self, minutes: float) -> list[ActivitySession]:
+        start_at = utc_now() - timedelta(minutes=minutes)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT start_at, end_at, label, summary, event_count, confidence
+                FROM sessions
+                WHERE end_at >= ?
+                ORDER BY start_at ASC
+                """,
+                (start_at.isoformat(),),
+            ).fetchall()
+
+        return [session_from_row(row) for row in rows]
+
+    def replace_sessions(self, sessions: list[ActivitySession]) -> None:
+        if not sessions:
+            return
+
+        with self._connect() as connection:
+            for session in sessions:
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO sessions (
+                        start_at, end_at, label, summary, event_count, confidence
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session.start_at,
+                        session.end_at,
+                        session.label,
+                        session.summary,
+                        session.event_count,
+                        session.confidence,
+                    ),
+                )
+
+
+def session_from_row(row: sqlite3.Row) -> ActivitySession:
+    return ActivitySession(
+        start_at=row["start_at"],
+        end_at=row["end_at"],
+        label=row["label"],
+        summary=row["summary"],
+        event_count=row["event_count"],
+        confidence=row["confidence"],
+    )
+
+
+def sessionize_events(
+    events: list[WindowSnapshot],
+    gap_minutes: float = 8,
+) -> list[ActivitySession]:
+    if not events:
+        return []
+
+    sorted_events = sorted(events, key=lambda event: parse_timestamp(event.observed_at))
+    chunks: list[list[WindowSnapshot]] = []
+    current: list[WindowSnapshot] = []
+    current_label: str | None = None
+    previous_at: datetime | None = None
+
+    for event in sorted_events:
+        observed_at = parse_timestamp(event.observed_at)
+        label = classify_event(event)
+
+        starts_new = False
+        if previous_at is not None and observed_at - previous_at > timedelta(minutes=gap_minutes):
+            starts_new = True
+        elif current and label != current_label and len(current) >= 3:
+            starts_new = True
+
+        if starts_new:
+            chunks.append(current)
+            current = []
+
+        current.append(event)
+        current_label = dominant_label(current)
+        previous_at = observed_at
+
+    if current:
+        chunks.append(current)
+
+    return [summarize_chunk(chunk) for chunk in chunks if chunk]
+
+
+def classify_event(event: WindowSnapshot) -> str:
+    text = f"{event.app_name} {event.window_title or ''}".lower()
+
+    if "jarvis" in text or "codex" in text:
+        return "Jarvis"
+    if "actuate" in text:
+        return "Actuate"
+    if "shwaz" in text:
+        return "Shwaz"
+    if "school" in text or "canvas" in text or "gradescope" in text:
+        return "School"
+    if "calendar" in text or "mail" in text or "messages" in text or "slack" in text:
+        return "Admin"
+    if event.app_name.lower() in {"code", "xcode", "terminal", "iterm2"}:
+        return "Coding"
+    if event.app_name.lower() in {"safari", "chrome", "arc", "firefox"}:
+        return "Browsing"
+    return "Unknown"
+
+
+def dominant_label(events: list[WindowSnapshot]) -> str:
+    return dominant_counted_label([classify_event(event) for event in events])
+
+
+def summarize_chunk(events: list[WindowSnapshot]) -> ActivitySession:
+    start_at = parse_timestamp(events[0].observed_at)
+    end_at = parse_timestamp(events[-1].observed_at)
+    labels = [classify_event(event) for event in events]
+    label_counts = count_labels(labels)
+    label = dominant_counted_label(labels)
+    app_names = ordered_unique(event.app_name for event in events)
+    title_samples = ordered_unique(
+        title for title in (event.window_title for event in events) if title
+    )[:3]
+
+    app_switches = sum(
+        1
+        for previous, current in zip(events, events[1:])
+        if previous.app_name != current.app_name
+    )
+    confidence = round(label_counts[label] / len(events), 2)
+
+    if len(app_names) >= 4 and app_switches >= max(3, len(events) // 3):
+        label = "Mixed/context switching"
+        confidence = min(confidence, 0.6)
+
+    summary = build_summary(label, app_names, title_samples)
+
+    return ActivitySession(
+        start_at=start_at.isoformat(),
+        end_at=end_at.isoformat(),
+        label=label,
+        summary=summary,
+        event_count=len(events),
+        confidence=confidence,
+    )
+
+
+def count_labels(labels: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for label in labels:
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def dominant_counted_label(labels: list[str]) -> str:
+    counts = count_labels(labels)
+    best_label = labels[0]
+    best_count = counts[best_label]
+    for label in labels:
+        count = counts[label]
+        if count > best_count:
+            best_label = label
+            best_count = count
+    return best_label
+
+
+def build_summary(
+    label: str,
+    app_names: list[str],
+    title_samples: list[str],
+) -> str:
+    apps = ", ".join(app_names[:4])
+    if label == "Mixed/context switching":
+        base = f"Moved between {apps} with frequent context switches."
+    elif label == "Jarvis":
+        base = f"Worked on Jarvis using {apps}."
+    elif label in {"Actuate", "Shwaz", "School", "Admin"}:
+        base = f"Worked on {label} activity using {apps}."
+    elif label == "Coding":
+        base = f"Worked in coding tools: {apps}."
+    elif label == "Browsing":
+        base = f"Browsed or researched in {apps}."
+    else:
+        base = f"Worked in {apps}."
+
+    if title_samples:
+        return f"{base} Notable windows: {'; '.join(title_samples)}."
+    return base
+
+
+def ordered_unique(values) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def render_recap(sessions: list[ActivitySession]) -> str:
+    if not sessions:
+        return "No window activity found for that range."
+
+    lines: list[str] = []
+    for session in sessions:
+        start = parse_timestamp(session.start_at).strftime("%H:%M")
+        end = parse_timestamp(session.end_at).strftime("%H:%M")
+        lines.append(f"{start}-{end}  {session.label}")
+        lines.append(session.summary)
+    return "\n".join(lines)
+
+
+def format_session_context(sessions: list[ActivitySession], max_sessions: int = 12) -> str:
+    if not sessions:
+        return ""
+
+    lines: list[str] = []
+    for session in sessions[-max_sessions:]:
+        start = parse_timestamp(session.start_at).strftime("%H:%M")
+        end = parse_timestamp(session.end_at).strftime("%H:%M")
+        lines.append(f"- {start}-{end} {session.label}: {session.summary}")
+    return "\n".join(lines)

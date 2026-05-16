@@ -36,7 +36,14 @@ It currently exposes:
 - `GET /v1/window/latest`
 - `POST /v1/ask`
 
-`POST /v1/ask` proxies a prompt to local Ollama via `/api/chat` and streams plain text back to the caller. By default it reads recent `window-events.jsonl` entries, compacts repeated foreground windows into a short timeline, and injects that timeline into the prompt. The default Ollama request uses `model: gemma4.e4b`, `think: false`, `stream: true`, and `temperature: 0`.
+`POST /v1/ask` proxies a prompt to local Ollama via `/api/chat` and streams plain text back to the caller. By default it reads recent SQLite-backed session summaries plus recent raw window events, then injects both into the prompt. The default Ollama request uses `model: gemma4.e4b`, `think: false`, `stream: true`, and `temperature: 0`.
+
+The Mac mini keeps JSONL as an append-only backup and stores queryable memory in SQLite at `~/.jarvis/jarvis.sqlite` by default. Current tables:
+
+- `window_events`: one row per observed active-window event.
+- `sessions`: on-demand session chunks with label, summary, event count, and confidence.
+
+`POST /v1/recap` builds session chunks for a requested time range and returns a text recap. The MacBook CLI exposes this as `jarvis recap`, `jarvis recap --last 2h`, and `jarvis recap --today`.
 
 ## Communication Direction
 

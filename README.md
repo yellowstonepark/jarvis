@@ -52,16 +52,25 @@ jarvis ask --history-minutes 60 "summarize my last hour"
 jarvis ask --no-window-history "what is the fastest way to test this?"
 ```
 
+Generate a structured session recap from the Mac mini memory database:
+
+```sh
+jarvis recap
+jarvis recap --last 2h
+jarvis recap --today
+```
+
 If `~/.jarvis/receiver-url` is not configured, pass the ask endpoint explicitly:
 
 ```sh
 jarvis ask --ask-url http://100.110.15.28:8765/v1/ask "what was I doing recently?"
 ```
 
-By default, received window events are appended on the Mac mini to:
+By default, received window events are appended on the Mac mini to JSONL and also written into SQLite:
 
 ```sh
 ~/.jarvis/window-events.jsonl
+~/.jarvis/jarvis.sqlite
 ```
 
 You can choose a different JSONL log path:

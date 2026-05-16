@@ -2,17 +2,20 @@ import json
 import tempfile
 import unittest
 import unittest.mock
+from datetime import datetime
 from pathlib import Path
 
 from jarvis.common.models import WindowSnapshot
 from jarvis.mac_mini.server import OllamaConfig, State, build_ask_prompt, format_window_timeline, open_ollama_chat
+from jarvis.mac_mini.memory import MemoryStore, render_recap
 
 
 class StateTests(unittest.TestCase):
     def test_set_latest_window_appends_jsonl_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             event_log = Path(tmpdir) / ".jarvis" / "window-events.jsonl"
-            state = State(event_log)
+            db_path = Path(tmpdir) / ".jarvis" / "jarvis.sqlite"
+            state = State(event_log, db_path)
             snapshot = WindowSnapshot(
                 app_name="Safari",
                 window_title="OpenAI",
@@ -26,6 +29,27 @@ class StateTests(unittest.TestCase):
             lines = event_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 1)
             self.assertEqual(json.loads(lines[0]), json.loads(snapshot.to_json()))
+
+
+class MemoryStoreTests(unittest.TestCase):
+    def test_memory_store_persists_window_events_and_builds_recap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = MemoryStore(Path(tmpdir) / "jarvis.sqlite")
+            store.insert_window_event(
+                WindowSnapshot("Terminal", "jarvis", "2026-05-16T18:00:00+00:00", "macbook")
+            )
+            store.insert_window_event(
+                WindowSnapshot("Code", "server.py", "2026-05-16T18:01:00+00:00", "macbook")
+            )
+
+            sessions = store.build_sessions(
+                datetime.fromisoformat("2026-05-16T17:59:00+00:00"),
+                datetime.fromisoformat("2026-05-16T18:02:00+00:00"),
+            )
+
+            recap = render_recap(sessions)
+            self.assertIn("18:00-18:01", recap)
+            self.assertIn("Jarvis", recap)
 
 
 class TimelinePromptTests(unittest.TestCase):
@@ -49,7 +73,7 @@ class TimelinePromptTests(unittest.TestCase):
         prompt = build_ask_prompt("what was I doing?", events, 30)
 
         self.assertIn("User question:\nwhat was I doing?", prompt)
-        self.assertIn("Recent window timeline, last 30 minutes", prompt)
+        self.assertIn("Recent raw window timeline, last 30 minutes", prompt)
         self.assertIn("Safari - Ollama docs", prompt)
         self.assertIn("Do not invent details", prompt)
 

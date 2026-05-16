@@ -23,25 +23,57 @@ let dateFormatter = ISO8601DateFormatter()
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
+    private var permissionTimer: Timer?
+    private var isRecording = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard terminateIfAnotherJarvisIsRunning() == false else {
             return
         }
 
-        let trusted = requestAccessibilityIfNeeded()
-        log("Jarvis native app started accessibility_trusted=\(trusted)")
+        log("Jarvis native app started")
+        waitForAccessibilityThenStart()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        permissionTimer?.invalidate()
+        timer?.invalidate()
+        log("Jarvis native app stopping")
+        return .terminateNow
+    }
+
+    private func waitForAccessibilityThenStart() {
+        if AXIsProcessTrusted() {
+            startRecording()
+            return
+        }
+
+        requestAccessibilityIfNeeded()
+        log("Jarvis waiting for Accessibility permission")
+
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            guard AXIsProcessTrusted() else {
+                return
+            }
+
+            timer.invalidate()
+            self?.permissionTimer = nil
+            self?.startRecording()
+        }
+    }
+
+    private func startRecording() {
+        guard isRecording == false else {
+            return
+        }
+
+        isRecording = true
+        log("Jarvis Accessibility trusted; starting active window stream")
 
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
             recordActiveWindow()
         }
         timer?.fire()
-    }
-
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        timer?.invalidate()
-        log("Jarvis native app stopping")
-        return .terminateNow
     }
 }
 
@@ -69,13 +101,9 @@ func terminateIfAnotherJarvisIsRunning() -> Bool {
     return false
 }
 
-func requestAccessibilityIfNeeded() -> Bool {
-    if AXIsProcessTrusted() {
-        return true
-    }
-
+func requestAccessibilityIfNeeded() {
     let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
-    return AXIsProcessTrustedWithOptions(options as CFDictionary)
+    _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
 }
 
 func recordActiveWindow() {
