@@ -25,8 +25,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        requestAccessibilityIfNeeded()
-        log("Jarvis native app started")
+        guard terminateIfAnotherJarvisIsRunning() == false else {
+            return
+        }
+
+        let trusted = requestAccessibilityIfNeeded()
+        log("Jarvis native app started accessibility_trusted=\(trusted)")
 
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
             recordActiveWindow()
@@ -47,9 +51,31 @@ app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()
 
-func requestAccessibilityIfNeeded() {
+func terminateIfAnotherJarvisIsRunning() -> Bool {
+    let currentPID = ProcessInfo.processInfo.processIdentifier
+    let bundleIdentifier = Bundle.main.bundleIdentifier
+
+    let alreadyRunning = NSWorkspace.shared.runningApplications.contains { application in
+        application.processIdentifier != currentPID
+            && application.bundleIdentifier == bundleIdentifier
+    }
+
+    if alreadyRunning {
+        log("Jarvis native app duplicate launch ignored")
+        NSApp.terminate(nil)
+        return true
+    }
+
+    return false
+}
+
+func requestAccessibilityIfNeeded() -> Bool {
+    if AXIsProcessTrusted() {
+        return true
+    }
+
     let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
-    _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
+    return AXIsProcessTrustedWithOptions(options as CFDictionary)
 }
 
 func recordActiveWindow() {
@@ -113,7 +139,12 @@ func sendSnapshot(_ data: Data) {
         return
     }
 
-    flushOutbox(to: receiverURL) { flushed in
+    flushOutbox(to: receiverURL) { flushed, completed in
+        if completed == false {
+            appendToOutbox(data)
+            return
+        }
+
         postSnapshot(data, to: receiverURL) { success in
             if success {
                 if flushed > 0 {
@@ -126,10 +157,10 @@ func sendSnapshot(_ data: Data) {
     }
 }
 
-func flushOutbox(to receiverURL: URL, completion: @escaping (Int) -> Void) {
+func flushOutbox(to receiverURL: URL, completion: @escaping (Int, Bool) -> Void) {
     let queuedEvents = readOutbox()
     if queuedEvents.isEmpty {
-        completion(0)
+        completion(0, true)
         return
     }
 
@@ -141,11 +172,11 @@ func sendQueuedEvents(
     index: Int,
     sent: Int,
     to receiverURL: URL,
-    completion: @escaping (Int) -> Void
+    completion: @escaping (Int, Bool) -> Void
 ) {
     if index >= events.count {
         clearOutbox()
-        completion(sent)
+        completion(sent, true)
         return
     }
 
@@ -156,7 +187,7 @@ func sendQueuedEvents(
         }
 
         replaceOutbox(Array(events[index...]))
-        completion(sent)
+        completion(sent, false)
     }
 }
 

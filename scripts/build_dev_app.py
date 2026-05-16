@@ -39,6 +39,15 @@ def write_info_plist() -> None:
         "CFBundleVersion": "0.1.0",
         "LSMinimumSystemVersion": "13.0",
         "LSUIElement": True,
+        "NSAppTransportSecurity": {
+            "NSAllowsLocalNetworking": True,
+            "NSExceptionDomains": {
+                "100.110.15.28": {
+                    "NSExceptionAllowsInsecureHTTPLoads": True,
+                    "NSExceptionMinimumTLSVersion": "TLSv1.2",
+                },
+            },
+        },
     }
 
     with (CONTENTS / "Info.plist").open("wb") as file:
