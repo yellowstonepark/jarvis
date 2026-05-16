@@ -1,0 +1,15 @@
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "A local Mac assistant prototype."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+
+[project.scripts]
+jarvis = "jarvis.mac_agent.cli:main"
+jarvis-mini = "jarvis.mac_mini.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
