@@ -24,6 +24,7 @@ class ActivitySession:
     open_loops: tuple[str, ...] = ()
     evidence_windows: tuple[str, ...] = ()
     updated_at: str = ""
+    id: int | None = None
 
 
 def should_ignore_window_event(snapshot: WindowSnapshot) -> bool:
@@ -328,7 +329,7 @@ class MemoryStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT start_at, end_at, label, summary, event_count, confidence, summary_source, category, key_actions, open_loops, evidence_windows, updated_at
+                SELECT id, start_at, end_at, label, summary, event_count, confidence, summary_source, category, key_actions, open_loops, evidence_windows, updated_at
                 FROM sessions
                 WHERE end_at >= ?
                 ORDER BY start_at ASC
@@ -346,7 +347,7 @@ class MemoryStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT start_at, end_at, label, summary, event_count, confidence, summary_source, category, key_actions, open_loops, evidence_windows, updated_at
+                SELECT id, start_at, end_at, label, summary, event_count, confidence, summary_source, category, key_actions, open_loops, evidence_windows, updated_at
                 FROM sessions
                 WHERE end_at >= ? AND start_at <= ?
                 ORDER BY start_at ASC
@@ -399,6 +400,82 @@ class MemoryStore:
                     )
                     insert_session_fts_session(connection, cursor.lastrowid, session)
 
+
+    def session_by_id(self, session_id: int) -> ActivitySession | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, start_at, end_at, label, summary, event_count, confidence,
+                       summary_source, category, key_actions, open_loops,
+                       evidence_windows, updated_at
+                FROM sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+        return session_from_row(row)
+
+    def recent_sessions_by_hours(self, hours: float) -> list[ActivitySession]:
+        start_at = utc_now() - timedelta(hours=hours)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, start_at, end_at, label, summary, event_count, confidence,
+                       summary_source, category, key_actions, open_loops,
+                       evidence_windows, updated_at
+                FROM sessions
+                WHERE end_at >= ?
+                ORDER BY start_at ASC
+                """,
+                (start_at.isoformat(),),
+            ).fetchall()
+
+        return dedupe_sessions([session_from_row(row) for row in rows])
+
+    def memory_stats(self) -> dict[str, object]:
+        with self._connect() as connection:
+            oldest_event = connection.execute(
+                "SELECT observed_at FROM window_events ORDER BY observed_at ASC LIMIT 1"
+            ).fetchone()
+            newest_event = connection.execute(
+                "SELECT observed_at FROM window_events ORDER BY observed_at DESC LIMIT 1"
+            ).fetchone()
+            window_event_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM window_events"
+            ).fetchone()["count"]
+            session_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM sessions"
+            ).fetchone()["count"]
+            ollama_summary_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM sessions WHERE summary_source = 'ollama'"
+            ).fetchone()["count"]
+            heuristic_summary_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM sessions WHERE summary_source != 'ollama'"
+            ).fetchone()["count"]
+            fts_row_count = None
+            if self._fts_available:
+                try:
+                    fts_row_count = connection.execute(
+                        "SELECT COUNT(*) AS count FROM session_fts"
+                    ).fetchone()["count"]
+                except sqlite3.OperationalError:
+                    fts_row_count = None
+
+        return {
+            "db_path": str(self.path),
+            "oldest_event_time": oldest_event["observed_at"] if oldest_event else None,
+            "newest_event_time": newest_event["observed_at"] if newest_event else None,
+            "window_event_count": window_event_count,
+            "session_count": session_count,
+            "ollama_summary_count": ollama_summary_count,
+            "heuristic_summary_count": heuristic_summary_count,
+            "fts_available": self._fts_available,
+            "fts_row_count": fts_row_count,
+        }
+
     def search_sessions(self, query: str, limit: int = 6) -> list[ActivitySession]:
         if not self._fts_available:
             return []
@@ -411,7 +488,7 @@ class MemoryStore:
             try:
                 rows = connection.execute(
                     """
-                    SELECT s.start_at, s.end_at, s.label, s.summary, s.event_count,
+                    SELECT s.id, s.start_at, s.end_at, s.label, s.summary, s.event_count,
                            s.confidence, s.summary_source, s.category, s.key_actions,
                            s.open_loops, s.evidence_windows, s.updated_at
                     FROM session_fts
@@ -522,7 +599,7 @@ def existing_smart_session(
 ) -> ActivitySession | None:
     row = connection.execute(
         """
-        SELECT start_at, end_at, label, summary, event_count, confidence, summary_source, category, key_actions, open_loops, evidence_windows, updated_at
+        SELECT id, start_at, end_at, label, summary, event_count, confidence, summary_source, category, key_actions, open_loops, evidence_windows, updated_at
         FROM sessions
         WHERE start_at = ? AND end_at = ? AND summary_source = 'ollama'
         """,
@@ -559,6 +636,7 @@ def session_from_row(row: sqlite3.Row) -> ActivitySession:
         open_loops=decode_json_array(row["open_loops"]),
         evidence_windows=decode_json_array(row["evidence_windows"]),
         updated_at=row["updated_at"],
+        id=row["id"] if "id" in row.keys() else None,
     )
 
 
@@ -803,6 +881,7 @@ def replace_session_summary(
         open_loops=open_loops,
         evidence_windows=evidence_windows or session.evidence_windows,
         updated_at=utc_now().isoformat(),
+        id=session.id,
     )
 
 

@@ -6,7 +6,15 @@ from unittest.mock import MagicMock, patch
 from urllib.error import URLError
 
 from jarvis.common.models import WindowSnapshot
-from jarvis.mac_agent.client import AskClient, WindowEventClient, WindowEventOutbox, WindowEventSendError, ask_endpoint_from_receiver_url
+from jarvis.mac_agent.client import (
+    AskClient,
+    MemoryClient,
+    WindowEventClient,
+    WindowEventOutbox,
+    WindowEventSendError,
+    ask_endpoint_from_receiver_url,
+    memory_endpoint_from_receiver_url,
+)
 
 
 def snapshot(app_name: str, observed_at: str = "2026-05-16T12:00:00+00:00") -> WindowSnapshot:
@@ -89,6 +97,27 @@ class AskEndpointTests(unittest.TestCase):
             ask_endpoint_from_receiver_url("http://100.110.15.28:8765"),
             "http://100.110.15.28:8765/v1/ask",
         )
+
+    def test_memory_endpoint_from_ask_receiver_url(self) -> None:
+        self.assertEqual(
+            memory_endpoint_from_receiver_url("http://100.110.15.28:8765/v1/ask"),
+            "http://100.110.15.28:8765/v1/memory",
+        )
+
+
+class MemoryClientTests(unittest.TestCase):
+
+    @patch("jarvis.mac_agent.client.urlopen")
+    def test_memory_client_gets_recent_sessions(self, mock_urlopen) -> None:
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"sessions":[]}'
+        mock_urlopen.return_value = response
+
+        payload = MemoryClient("http://mini:8765/v1/memory").recent(4)
+
+        request = mock_urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://mini:8765/v1/memory/recent?hours=4")
+        self.assertEqual(payload, {"sessions": []})
 
 
 class AskClientTests(unittest.TestCase):

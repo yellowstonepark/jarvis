@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import threading
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -107,6 +108,29 @@ class State:
             oldest = self._memory.oldest_window_event()
         return format_oldest_memory(oldest)
 
+    def memory_recent(self, hours: float) -> list[ActivitySession]:
+        with self._lock:
+            return self._memory.recent_sessions_by_hours(hours)
+
+    def memory_search(self, query: str, limit: int = 10) -> list[ActivitySession]:
+        with self._lock:
+            return self._memory.search_sessions(query, limit=limit)
+
+    def memory_session_detail(self, session_id: int) -> dict | None:
+        with self._lock:
+            session = self._memory.session_by_id(session_id)
+            if session is None:
+                return None
+            events = self._memory.window_events_for_session(session)
+        return {
+            "session": session_to_dict(session),
+            "raw_events": [window_snapshot_to_dict(event) for event in compact_window_events(events)],
+        }
+
+    def memory_stats(self) -> dict[str, object]:
+        with self._lock:
+            return self._memory.memory_stats()
+
     def recent_window_events(
         self,
         minutes: float,
@@ -200,11 +224,30 @@ def build_handler(state: State, ollama: OllamaConfig):
         server_version = "JarvisMini/0.1"
 
         def do_GET(self) -> None:
-            if self.path == "/health":
+            parsed = urlparse(self.path)
+            path = parsed.path
+
+            if path == "/health":
                 self.write_json(HTTPStatus.OK, {"ok": True})
                 return
 
-            if self.path == "/v1/window/latest":
+            if path == "/v1/memory/recent":
+                self.handle_memory_recent(parsed.query)
+                return
+
+            if path == "/v1/memory/search":
+                self.handle_memory_search(parsed.query)
+                return
+
+            if path.startswith("/v1/memory/session/"):
+                self.handle_memory_session(path)
+                return
+
+            if path == "/v1/memory/stats":
+                self.write_json(HTTPStatus.OK, state.memory_stats())
+                return
+
+            if path == "/v1/window/latest":
                 latest = state.get_latest_window()
                 if latest is None:
                     self.write_json(HTTPStatus.NOT_FOUND, {"error": "no window snapshots"})
@@ -224,6 +267,58 @@ def build_handler(state: State, ollama: OllamaConfig):
                 return
 
             self.write_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+
+
+        def handle_memory_recent(self, raw_query: str) -> None:
+            try:
+                query = parse_qs(raw_query)
+                hours = float(query.get("hours", ["4"])[0])
+            except (TypeError, ValueError):
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "hours must be a number"})
+                return
+
+            if hours <= 0:
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "hours must be greater than 0"})
+                return
+
+            sessions = state.memory_recent(hours)
+            self.write_json(
+                HTTPStatus.OK,
+                {"sessions": [session_to_dict(session) for session in sessions]},
+            )
+
+        def handle_memory_search(self, raw_query: str) -> None:
+            query = parse_qs(raw_query)
+            term = query.get("q", [""])[0].strip()
+            try:
+                limit = int(query.get("limit", ["10"])[0])
+            except (TypeError, ValueError):
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "limit must be an integer"})
+                return
+
+            if limit <= 0:
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "limit must be greater than 0"})
+                return
+
+            sessions = state.memory_search(term, limit=limit)
+            self.write_json(
+                HTTPStatus.OK,
+                {"sessions": [session_to_dict(session) for session in sessions]},
+            )
+
+        def handle_memory_session(self, path: str) -> None:
+            raw_id = path.removeprefix("/v1/memory/session/")
+            try:
+                session_id = int(unquote(raw_id))
+            except ValueError:
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "session id must be an integer"})
+                return
+
+            detail = state.memory_session_detail(session_id)
+            if detail is None:
+                self.write_json(HTTPStatus.NOT_FOUND, {"error": "session not found"})
+                return
+            self.write_json(HTTPStatus.OK, detail)
 
         def handle_window_event(self) -> None:
             length = int(self.headers.get("content-length", "0"))
@@ -345,6 +440,45 @@ def build_handler(state: State, ollama: OllamaConfig):
 
 
 
+
+
+def session_to_dict(session: ActivitySession) -> dict[str, object]:
+    return {
+        "id": session.id,
+        "start_at": session.start_at,
+        "end_at": session.end_at,
+        "label": session.label,
+        "category": session.category,
+        "summary": session.summary,
+        "key_actions": list(session.key_actions),
+        "open_loops": list(session.open_loops),
+        "evidence_windows": list(session.evidence_windows),
+        "confidence": session.confidence,
+        "summary_source": session.summary_source,
+        "event_count": session.event_count,
+        "updated_at": session.updated_at,
+    }
+
+
+def window_snapshot_to_dict(snapshot: WindowSnapshot) -> dict[str, str | None]:
+    return {
+        "observed_at": snapshot.observed_at,
+        "source": snapshot.source,
+        "app_name": snapshot.app_name,
+        "window_title": snapshot.window_title,
+    }
+
+
+def compact_window_events(events: list[WindowSnapshot]) -> list[WindowSnapshot]:
+    compacted: list[WindowSnapshot] = []
+    previous_key: tuple[str, str | None] | None = None
+    for event in sorted(events, key=lambda item: parse_timestamp(item.observed_at)):
+        key = (event.app_name, event.window_title)
+        if key == previous_key:
+            continue
+        compacted.append(event)
+        previous_key = key
+    return compacted
 
 def session_key(session: ActivitySession) -> tuple[str, str]:
     return (session.start_at, session.end_at)

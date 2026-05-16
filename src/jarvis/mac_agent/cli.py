@@ -7,8 +7,11 @@ import time
 from jarvis.mac_agent.client import (
     AskClient,
     AskStreamError,
+    MemoryClient,
+    MemoryInspectError,
     WindowEventClient,
     WindowEventSendError,
+    default_memory_endpoint,
     default_receiver_endpoint,
 )
 from jarvis.mac_agent.window import ActiveWindowError, get_active_window
@@ -57,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
     raw_args = sys.argv[1:] if argv is None else argv
     if raw_args and raw_args[0] == "ask":
         return ask(raw_args[1:])
+    if raw_args and raw_args[0] == "memory":
+        return memory(raw_args[1:])
 
     args = build_parser().parse_args(raw_args)
 
@@ -159,6 +164,150 @@ def ask(argv: list[str]) -> int:
         print(f"failed to ask Jarvis: {error}", file=sys.stderr)
         return 1
 
+
+
+def memory(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="jarvis memory",
+        description="Inspect Jarvis memory stored on the Mac mini.",
+    )
+    parser.add_argument(
+        "--memory-url",
+        help="Jarvis memory endpoint. Defaults to receiver URL converted to /v1/memory.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Receiver timeout in seconds. Default: 10.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    recent_parser = subparsers.add_parser("recent", help="Show recent sessions.")
+    recent_parser.add_argument("--hours", type=float, default=4.0)
+
+    search_parser = subparsers.add_parser("search", help="Search session memory.")
+    search_parser.add_argument("query", nargs="+")
+    search_parser.add_argument("--limit", type=int, default=10)
+
+    session_parser = subparsers.add_parser("session", help="Show one session with raw events.")
+    session_parser.add_argument("id", type=int)
+
+    subparsers.add_parser("stats", help="Show memory database stats.")
+
+    args = parser.parse_args(argv)
+    if args.timeout <= 0:
+        print("--timeout must be greater than 0.", file=sys.stderr)
+        return 2
+
+    endpoint = args.memory_url or default_memory_endpoint()
+    if endpoint is None:
+        print(
+            "No Jarvis memory endpoint configured. Set ~/.jarvis/receiver-url or pass --memory-url.",
+            file=sys.stderr,
+        )
+        return 2
+
+    client = MemoryClient(endpoint, args.timeout)
+    try:
+        if args.command == "recent":
+            if args.hours <= 0:
+                print("--hours must be greater than 0.", file=sys.stderr)
+                return 2
+            print_sessions(client.recent(args.hours).get("sessions", []))
+            return 0
+
+        if args.command == "search":
+            if args.limit <= 0:
+                print("--limit must be greater than 0.", file=sys.stderr)
+                return 2
+            print_sessions(client.search(" ".join(args.query), args.limit).get("sessions", []))
+            return 0
+
+        if args.command == "session":
+            print_session_detail(client.session(args.id))
+            return 0
+
+        if args.command == "stats":
+            print_stats(client.stats())
+            return 0
+    except MemoryInspectError as error:
+        print(f"failed to inspect Jarvis memory: {error}", file=sys.stderr)
+        return 1
+
+    parser.error("unknown memory command")
+    return 2
+
+
+def print_sessions(sessions: list[dict]) -> None:
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    for session in sessions:
+        print(format_session_header(session))
+        print(f"  Summary: {session.get('summary') or ''}")
+        print(f"  Key actions: {format_list(session.get('key_actions', []))}")
+        print(f"  Open loops: {format_list(session.get('open_loops', []))}")
+        print(
+            "  "
+            f"confidence={session.get('confidence')} "
+            f"source={session.get('summary_source')} "
+            f"events={session.get('event_count')}"
+        )
+        print()
+
+
+def print_session_detail(payload: dict) -> None:
+    session = payload.get("session") or {}
+    print(format_session_header(session))
+    print(f"Summary: {session.get('summary') or ''}")
+    print(f"Category: {session.get('category') or ''}")
+    print(f"Confidence: {session.get('confidence')}")
+    print(f"Summary source: {session.get('summary_source')}")
+    print(f"Event count: {session.get('event_count')}")
+    print(f"Updated at: {session.get('updated_at') or ''}")
+    print(f"Key actions: {format_list(session.get('key_actions', []))}")
+    print(f"Open loops: {format_list(session.get('open_loops', []))}")
+    print(f"Evidence windows: {format_list(session.get('evidence_windows', []))}")
+    print("Raw compacted events:")
+    raw_events = payload.get("raw_events") or []
+    if not raw_events:
+        print("  No raw events found for this session.")
+        return
+    for event in raw_events:
+        title = f" - {event.get('window_title')}" if event.get("window_title") else ""
+        print(f"  - {event.get('observed_at')} {event.get('app_name')}{title}")
+
+
+def print_stats(stats: dict) -> None:
+    for key in [
+        "db_path",
+        "oldest_event_time",
+        "newest_event_time",
+        "window_event_count",
+        "session_count",
+        "ollama_summary_count",
+        "heuristic_summary_count",
+        "fts_available",
+        "fts_row_count",
+    ]:
+        print(f"{key}: {stats.get(key)}")
+
+
+def format_session_header(session: dict) -> str:
+    session_id = session.get("id")
+    start = session.get("start_at") or "?"
+    end = session.get("end_at") or "?"
+    label = session.get("label") or ""
+    category = session.get("category") or ""
+    return f"[{session_id}] {start} -> {end}  {label} ({category})"
+
+
+def format_list(values) -> str:
+    if not values:
+        return "-"
+    return "; ".join(str(value) for value in values)
 
 def watch_active_window(
     interval: float,

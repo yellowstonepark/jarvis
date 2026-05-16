@@ -77,6 +77,18 @@ Example:
 }
 ```
 
+
+Inspect Jarvis memory without asking Ollama:
+
+```sh
+jarvis memory recent --hours 4
+jarvis memory search "Jarvis memory"
+jarvis memory session 12
+jarvis memory stats
+```
+
+These commands call the Mac mini over HTTP and show the SQLite-backed sessions, structured summaries, source evidence, compacted raw events, and database stats.
+
 Use plain chatbot mode when you do not want Jarvis to include window memory:
 
 ```sh

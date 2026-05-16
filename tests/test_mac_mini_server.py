@@ -10,6 +10,7 @@ from jarvis.mac_mini.server import (
     OllamaConfig,
     State,
     build_ask_prompt,
+    build_handler,
     format_user_profile,
     format_window_stats,
     format_window_timeline,
@@ -369,6 +370,116 @@ def render_fallback_session():
         category="Coding",
         evidence_windows=("Terminal - jarvis",),
     )
+
+
+class MemoryEndpointTests(unittest.TestCase):
+    def test_memory_recent_returns_sessions(self) -> None:
+        with memory_state() as state:
+            session = sample_session("Jarvis timezone memory")
+            state._memory.replace_sessions([session])
+
+            sessions = state.memory_recent(100000)
+
+            self.assertEqual(sessions[0].label, "Jarvis timezone memory")
+            self.assertIsNotNone(sessions[0].id)
+
+    def test_memory_search_uses_fts(self) -> None:
+        with memory_state() as state:
+            state._memory.replace_sessions([
+                sample_session("Jarvis timezone memory", summary="Worked on timezone profile recall."),
+                sample_session(
+                    "School work",
+                    start_at="2026-05-16T19:00:00+00:00",
+                    end_at="2026-05-16T19:05:00+00:00",
+                    summary="Reviewed course notes.",
+                ),
+            ])
+
+            sessions = state.memory_search("timezone")
+
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0].label, "Jarvis timezone memory")
+
+    def test_memory_session_includes_compacted_raw_events(self) -> None:
+        with memory_state() as state:
+            session = sample_session("Jarvis raw events")
+            state._memory.replace_sessions([session])
+            session_id = state._memory.search_sessions("raw events")[0].id
+            for snapshot in [
+                WindowSnapshot("Code", "memory.py", "2026-05-16T18:00:00+00:00", "macbook"),
+                WindowSnapshot("Code", "memory.py", "2026-05-16T18:01:00+00:00", "macbook"),
+                WindowSnapshot("Terminal", "jarvis", "2026-05-16T18:02:00+00:00", "macbook"),
+            ]:
+                state._memory.insert_window_event(snapshot)
+
+            payload = state.memory_session_detail(session_id)
+
+            self.assertEqual(payload["session"]["label"], "Jarvis raw events")
+            self.assertEqual(len(payload["raw_events"]), 2)
+            self.assertEqual(payload["raw_events"][0]["app_name"], "Code")
+            self.assertEqual(payload["raw_events"][1]["app_name"], "Terminal")
+
+    def test_memory_stats_returns_counts(self) -> None:
+        with memory_state() as state:
+            state._memory.insert_window_event(
+                WindowSnapshot("Code", "memory.py", "2026-05-16T18:00:00+00:00", "macbook")
+            )
+            state._memory.replace_sessions([
+                sample_session("Ollama summary", summary_source="ollama"),
+                sample_session("Heuristic summary", start_at="2026-05-16T19:00:00+00:00", end_at="2026-05-16T19:05:00+00:00"),
+            ])
+
+            payload = state.memory_stats()
+
+            self.assertEqual(payload["window_event_count"], 1)
+            self.assertEqual(payload["session_count"], 2)
+            self.assertEqual(payload["ollama_summary_count"], 1)
+            self.assertEqual(payload["heuristic_summary_count"], 1)
+            self.assertTrue(payload["fts_available"])
+
+    def test_memory_empty_db_is_graceful(self) -> None:
+        with memory_state() as state:
+            recent = state.memory_recent(4)
+            search = state.memory_search("timezone")
+            stats = state.memory_stats()
+
+            self.assertEqual(recent, [])
+            self.assertEqual(search, [])
+            self.assertIsNone(stats["oldest_event_time"])
+            self.assertEqual(stats["window_event_count"], 0)
+
+
+def sample_session(
+    label: str,
+    start_at: str = "2026-05-16T18:00:00+00:00",
+    end_at: str = "2026-05-16T18:05:00+00:00",
+    summary: str = "Worked on Jarvis memory inspection.",
+    summary_source: str = "heuristic",
+) -> ActivitySession:
+    return ActivitySession(
+        start_at=start_at,
+        end_at=end_at,
+        label=label,
+        category="Jarvis",
+        summary=summary,
+        event_count=5,
+        confidence=0.8,
+        summary_source=summary_source,
+        key_actions=("Inspected memory",),
+        open_loops=("Verify CLI output",),
+        evidence_windows=("Code - memory.py",),
+    )
+
+
+class memory_state:
+    def __enter__(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        root = Path(self.tmpdir.name)
+        self.state = State(root / "events.jsonl", root / "memory.sqlite")
+        return self.state
+
+    def __exit__(self, exc_type, exc, tb):
+        self.tmpdir.cleanup()
 
 
 class OllamaChatTests(unittest.TestCase):

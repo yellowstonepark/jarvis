@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from jarvis.common.models import WindowSnapshot
@@ -120,6 +121,10 @@ class AskStreamError(Exception):
     """Raised when Jarvis cannot stream an ask response from the receiver."""
 
 
+class MemoryInspectError(Exception):
+    """Raised when Jarvis memory inspection fails."""
+
+
 def default_receiver_endpoint() -> str | None:
     explicit_ask_url = os.environ.get("JARVIS_ASK_URL")
     if explicit_ask_url:
@@ -152,7 +157,26 @@ def local_timezone_name() -> str:
 def ask_endpoint_from_receiver_url(receiver_url: str) -> str:
     if receiver_url.endswith("/v1/window/events"):
         return receiver_url[: -len("/v1/window/events")] + "/v1/ask"
+    if receiver_url.endswith("/v1/memory"):
+        return receiver_url[: -len("/v1/memory")] + "/v1/ask"
     return receiver_url.rstrip("/") + "/v1/ask"
+
+
+def memory_endpoint_from_receiver_url(receiver_url: str) -> str:
+    if receiver_url.endswith("/v1/window/events"):
+        return receiver_url[: -len("/v1/window/events")] + "/v1/memory"
+    if receiver_url.endswith("/v1/ask"):
+        return receiver_url[: -len("/v1/ask")] + "/v1/memory"
+    if receiver_url.endswith("/v1/memory"):
+        return receiver_url
+    return receiver_url.rstrip("/") + "/v1/memory"
+
+
+def default_memory_endpoint() -> str | None:
+    ask_endpoint = default_receiver_endpoint()
+    if ask_endpoint is None:
+        return None
+    return memory_endpoint_from_receiver_url(ask_endpoint)
 
 
 @dataclass(frozen=True)
@@ -206,3 +230,40 @@ class AskClient:
             raise AskStreamError(f"could not reach receiver: {error.reason}") from error
         except TimeoutError as error:
             raise AskStreamError("timed out waiting for receiver") from error
+
+
+@dataclass(frozen=True)
+class MemoryClient:
+    endpoint: str
+    timeout: float = 10.0
+
+    def recent(self, hours: float) -> dict:
+        return self._get_json(f"/recent?{urlencode({'hours': hours})}")
+
+    def search(self, query: str, limit: int = 10) -> dict:
+        return self._get_json(f"/search?{urlencode({'q': query, 'limit': limit})}")
+
+    def session(self, session_id: int) -> dict:
+        return self._get_json(f"/session/{session_id}")
+
+    def stats(self) -> dict:
+        return self._get_json("/stats")
+
+    def _get_json(self, path: str) -> dict:
+        request = Request(
+            self.endpoint.rstrip("/") + path,
+            headers={"accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise MemoryInspectError(f"receiver returned HTTP {error.code}: {detail}") from error
+        except URLError as error:
+            raise MemoryInspectError(f"could not reach receiver: {error.reason}") from error
+        except TimeoutError as error:
+            raise MemoryInspectError("timed out waiting for receiver") from error
+        except json.JSONDecodeError as error:
+            raise MemoryInspectError(f"invalid memory response: {error}") from error
