@@ -44,16 +44,18 @@ ollama pull gemma4.e4b
 uv run jarvis-mini --host 100.110.15.28 --port 8765 --ollama-model gemma4.e4b
 ```
 
-Ask Jarvis from the MacBook:
+Ask Jarvis from the MacBook. By default, `/v1/ask` injects a compact timeline from the Mac mini's recent `~/.jarvis/window-events.jsonl` events:
 
 ```sh
-jarvis ask "what is the fastest way to test this?"
+jarvis ask "what was I doing recently?"
+jarvis ask --history-minutes 60 "summarize my last hour"
+jarvis ask --no-window-history "what is the fastest way to test this?"
 ```
 
 If `~/.jarvis/receiver-url` is not configured, pass the ask endpoint explicitly:
 
 ```sh
-jarvis ask --ask-url http://100.110.15.28:8765/v1/ask "what is the fastest way to test this?"
+jarvis ask --ask-url http://100.110.15.28:8765/v1/ask "what was I doing recently?"
 ```
 
 By default, received window events are appended on the Mac mini to:

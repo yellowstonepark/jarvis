@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from urllib.error import URLError
 
 from jarvis.common.models import WindowSnapshot
-from jarvis.mac_agent.client import WindowEventClient, WindowEventOutbox, WindowEventSendError, ask_endpoint_from_receiver_url
+from jarvis.mac_agent.client import AskClient, WindowEventClient, WindowEventOutbox, WindowEventSendError, ask_endpoint_from_receiver_url
 
 
 def snapshot(app_name: str, observed_at: str = "2026-05-16T12:00:00+00:00") -> WindowSnapshot:
@@ -88,6 +89,32 @@ class AskEndpointTests(unittest.TestCase):
             ask_endpoint_from_receiver_url("http://100.110.15.28:8765"),
             "http://100.110.15.28:8765/v1/ask",
         )
+
+
+class AskClientTests(unittest.TestCase):
+    @patch("jarvis.mac_agent.client.urlopen")
+    def test_stream_sends_window_history_settings(self, mock_urlopen) -> None:
+        response = MagicMock()
+        response.__enter__.return_value.read.side_effect = [b"o", b"k", b""]
+        mock_urlopen.return_value = response
+        chunks: list[str] = []
+
+        AskClient("http://mini:8765/v1/ask").stream(
+            "what was I doing?",
+            chunks.append,
+            with_window_history=True,
+            history_minutes=45,
+            max_history_events=120,
+        )
+
+        request = mock_urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(request.full_url, "http://mini:8765/v1/ask")
+        self.assertEqual(payload["prompt"], "what was I doing?")
+        self.assertIs(payload["with_window_history"], True)
+        self.assertEqual(payload["history_minutes"], 45)
+        self.assertEqual(payload["max_history_events"], 120)
+        self.assertEqual("".join(chunks), "ok")
 
 
 if __name__ == "__main__":

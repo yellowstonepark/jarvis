@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -47,11 +48,47 @@ class State:
     def event_log(self) -> Path:
         return self._event_log
 
+    def recent_window_events(
+        self,
+        minutes: float,
+    ) -> list[WindowSnapshot]:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+
+        with self._lock:
+            if not self._event_log.exists():
+                return []
+
+            events: list[WindowSnapshot] = []
+            with self._event_log.open(encoding="utf-8") as file:
+                for line in file:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        snapshot = WindowSnapshot.from_json(line)
+                        observed_at = parse_timestamp(snapshot.observed_at)
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        continue
+
+                    if observed_at >= cutoff:
+                        events.append(snapshot)
+
+        return events
+
     def _append_event(self, snapshot: WindowSnapshot) -> None:
         self._event_log.parent.mkdir(parents=True, exist_ok=True)
         with self._event_log.open("a", encoding="utf-8") as file:
             file.write(snapshot.to_json())
             file.write("\n")
+
+
+def parse_timestamp(value: str) -> datetime:
+    normalized = value.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def build_handler(state: State, ollama: OllamaConfig):
@@ -107,13 +144,32 @@ def build_handler(state: State, ollama: OllamaConfig):
             try:
                 payload = json.loads(raw_body)
                 prompt = payload["prompt"]
-            except (KeyError, TypeError, json.JSONDecodeError) as error:
+                with_window_history = payload.get("with_window_history", True)
+                history_minutes = float(payload.get("history_minutes", 30))
+                max_history_events = int(payload.get("max_history_events", 80))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 self.write_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid ask payload: {error}"})
                 return
 
             if not isinstance(prompt, str) or not prompt.strip():
                 self.write_json(HTTPStatus.BAD_REQUEST, {"error": "prompt must be a non-empty string"})
                 return
+
+            if not isinstance(with_window_history, bool):
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "with_window_history must be a boolean"})
+                return
+
+            if history_minutes <= 0:
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "history_minutes must be greater than 0"})
+                return
+
+            if max_history_events <= 0:
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "max_history_events must be greater than 0"})
+                return
+
+            if with_window_history:
+                events = state.recent_window_events(history_minutes)
+                prompt = build_ask_prompt(prompt, events, history_minutes, max_history_events)
 
             try:
                 ollama_response = open_ollama_chat(prompt, ollama)
@@ -143,6 +199,67 @@ def build_handler(state: State, ollama: OllamaConfig):
 
     return JarvisMiniHandler
 
+
+
+
+def build_ask_prompt(
+    question: str,
+    events: list[WindowSnapshot],
+    history_minutes: float,
+    max_segments: int = 80,
+) -> str:
+    timeline = format_window_timeline(events, max_segments)
+    if not timeline:
+        timeline = "- No recent window events were recorded."
+
+    return (
+        "You are Jarvis, a concise local assistant. Answer the user using only "
+        "the recent window timeline below when the question asks about activity, "
+        "focus, apps, projects, or recent work. If the timeline is insufficient, "
+        "say what is missing. Do not invent details.\n\n"
+        f"User question:\n{question.strip()}\n\n"
+        f"Recent window timeline, last {history_minutes:g} minutes:\n{timeline}\n\n"
+        "Answer concisely."
+    )
+
+
+def format_window_timeline(events: list[WindowSnapshot], max_segments: int = 80) -> str:
+    if not events:
+        return ""
+
+    sorted_events = sorted(events, key=lambda event: parse_timestamp(event.observed_at))
+    segments: list[tuple[datetime, datetime, WindowSnapshot]] = []
+
+    for event in sorted_events:
+        observed_at = parse_timestamp(event.observed_at)
+        if not segments:
+            segments.append((observed_at, observed_at, event))
+            continue
+
+        start, _, previous = segments[-1]
+        if (previous.app_name, previous.window_title) == (event.app_name, event.window_title):
+            segments[-1] = (start, observed_at, previous)
+        else:
+            segments.append((observed_at, observed_at, event))
+
+    if len(segments) > max_segments:
+        segments = segments[-max_segments:]
+
+    lines = []
+    for start, end, event in segments:
+        time_label = format_time_range(start, end)
+        title = f" - {event.window_title}" if event.window_title else ""
+        lines.append(f"- {time_label} {event.app_name}{title}")
+
+    return "\n".join(lines)
+
+
+def format_time_range(start: datetime, end: datetime) -> str:
+    start_label = start.strftime("%H:%M")
+    end_label = end.strftime("%H:%M")
+    if start_label == end_label:
+        return start_label
+    return f"{start_label}-{end_label}"
 
 
 def open_ollama_chat(prompt: str, config: OllamaConfig):

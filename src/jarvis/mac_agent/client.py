@@ -150,8 +150,23 @@ class AskClient:
     endpoint: str
     timeout: float = 60.0
 
-    def stream(self, prompt: str, write) -> None:
-        body = json.dumps({"prompt": prompt}, separators=(",", ":")).encode("utf-8")
+    def stream(
+        self,
+        prompt: str,
+        write,
+        with_window_history: bool = True,
+        history_minutes: float = 30,
+        max_history_events: int = 80,
+    ) -> None:
+        body = json.dumps(
+            {
+                "prompt": prompt,
+                "with_window_history": with_window_history,
+                "history_minutes": history_minutes,
+                "max_history_events": max_history_events,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
         request = Request(
             self.endpoint,
             data=body,

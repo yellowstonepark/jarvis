@@ -5,7 +5,7 @@ import unittest.mock
 from pathlib import Path
 
 from jarvis.common.models import WindowSnapshot
-from jarvis.mac_mini.server import OllamaConfig, State, open_ollama_chat
+from jarvis.mac_mini.server import OllamaConfig, State, build_ask_prompt, format_window_timeline, open_ollama_chat
 
 
 class StateTests(unittest.TestCase):
@@ -26,6 +26,32 @@ class StateTests(unittest.TestCase):
             lines = event_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 1)
             self.assertEqual(json.loads(lines[0]), json.loads(snapshot.to_json()))
+
+
+class TimelinePromptTests(unittest.TestCase):
+    def test_format_window_timeline_compacts_repeated_windows(self) -> None:
+        events = [
+            WindowSnapshot("Terminal", "jarvis", "2026-05-16T18:00:00+00:00", "macbook"),
+            WindowSnapshot("Terminal", "jarvis", "2026-05-16T18:00:30+00:00", "macbook"),
+            WindowSnapshot("Codex", "Codex", "2026-05-16T18:01:00+00:00", "macbook"),
+        ]
+
+        self.assertEqual(
+            format_window_timeline(events),
+            "- 18:00 Terminal - jarvis\n- 18:01 Codex - Codex",
+        )
+
+    def test_build_ask_prompt_includes_question_and_timeline(self) -> None:
+        events = [
+            WindowSnapshot("Safari", "Ollama docs", "2026-05-16T18:00:00+00:00", "macbook"),
+        ]
+
+        prompt = build_ask_prompt("what was I doing?", events, 30)
+
+        self.assertIn("User question:\nwhat was I doing?", prompt)
+        self.assertIn("Recent window timeline, last 30 minutes", prompt)
+        self.assertIn("Safari - Ollama docs", prompt)
+        self.assertIn("Do not invent details", prompt)
 
 
 class OllamaChatTests(unittest.TestCase):

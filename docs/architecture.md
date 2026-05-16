@@ -36,7 +36,7 @@ It currently exposes:
 - `GET /v1/window/latest`
 - `POST /v1/ask`
 
-`POST /v1/ask` proxies a prompt to local Ollama via `/api/chat` and streams plain text back to the caller. It is intentionally not connected to `window-events.jsonl` yet. The default Ollama request uses `model: gemma4.e4b`, `think: false`, `stream: true`, and `temperature: 0`.
+`POST /v1/ask` proxies a prompt to local Ollama via `/api/chat` and streams plain text back to the caller. By default it reads recent `window-events.jsonl` entries, compacts repeated foreground windows into a short timeline, and injects that timeline into the prompt. The default Ollama request uses `model: gemma4.e4b`, `think: false`, `stream: true`, and `temperature: 0`.
 
 ## Communication Direction
 

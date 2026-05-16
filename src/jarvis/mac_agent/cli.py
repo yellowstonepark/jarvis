@@ -99,10 +99,35 @@ def ask(argv: list[str]) -> int:
         default=60.0,
         help="Receiver timeout in seconds. Default: 60.0.",
     )
+    parser.add_argument(
+        "--history-minutes",
+        type=float,
+        default=30.0,
+        help="Minutes of recent window history to include. Default: 30.",
+    )
+    parser.add_argument(
+        "--max-history-events",
+        type=int,
+        default=80,
+        help="Maximum raw window events to consider before compaction. Default: 80.",
+    )
+    parser.add_argument(
+        "--no-window-history",
+        action="store_true",
+        help="Ask without injecting recent window history.",
+    )
     args = parser.parse_args(argv)
 
     if args.timeout <= 0:
         print("--timeout must be greater than 0.", file=sys.stderr)
+        return 2
+
+    if args.history_minutes <= 0:
+        print("--history-minutes must be greater than 0.", file=sys.stderr)
+        return 2
+
+    if args.max_history_events <= 0:
+        print("--max-history-events must be greater than 0.", file=sys.stderr)
         return 2
 
     endpoint = args.ask_url or default_receiver_endpoint()
@@ -121,7 +146,13 @@ def ask(argv: list[str]) -> int:
         sys.stdout.flush()
 
     try:
-        client.stream(prompt, write_stream)
+        client.stream(
+            prompt,
+            write_stream,
+            with_window_history=not args.no_window_history,
+            history_minutes=args.history_minutes,
+            max_history_events=args.max_history_events,
+        )
         print(flush=True)
         return 0
     except AskStreamError as error:
