@@ -7,7 +7,7 @@ from pathlib import Path
 
 from jarvis.common.models import WindowSnapshot
 from jarvis.mac_mini.server import OllamaConfig, State, build_ask_prompt, format_window_timeline, open_ollama_chat, parse_session_summary_response
-from jarvis.mac_mini.memory import MemoryStore, render_sessions
+from jarvis.mac_mini.memory import ActivitySession, MemoryStore, format_session_context, render_sessions
 
 
 class StateTests(unittest.TestCase):
@@ -51,6 +51,34 @@ class MemoryStoreTests(unittest.TestCase):
             self.assertIn("18:00-18:01", rendered_sessions)
             self.assertIn("Jarvis", rendered_sessions)
 
+    def test_memory_store_persists_structured_session_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = MemoryStore(Path(tmpdir) / "jarvis.sqlite")
+            session = ActivitySession(
+                start_at="2026-05-16T18:00:00+00:00",
+                end_at="2026-05-16T18:05:00+00:00",
+                label="Jarvis memory work",
+                category="Jarvis",
+                summary="Worked on structured memory.",
+                event_count=5,
+                confidence=0.9,
+                summary_source="ollama",
+                key_actions=("Added structured fields",),
+                open_loops=("Verify persistence",),
+                evidence_windows=("Code - memory.py",),
+                updated_at="2026-05-16T18:06:00+00:00",
+            )
+
+            store.replace_sessions([session])
+            stored = store.stored_sessions_between(
+                datetime.fromisoformat("2026-05-16T17:59:00+00:00"),
+                datetime.fromisoformat("2026-05-16T18:06:00+00:00"),
+            )
+
+            self.assertEqual(stored[0].key_actions, ("Added structured fields",))
+            self.assertEqual(stored[0].open_loops, ("Verify persistence",))
+            self.assertEqual(stored[0].evidence_windows, ("Code - memory.py",))
+
 
 class TimelinePromptTests(unittest.TestCase):
     def test_format_window_timeline_compacts_repeated_windows(self) -> None:
@@ -70,10 +98,27 @@ class TimelinePromptTests(unittest.TestCase):
             WindowSnapshot("Safari", "Ollama docs", "2026-05-16T18:00:00+00:00", "macbook"),
         ]
 
+        session_context = format_session_context([
+            ActivitySession(
+                start_at="2026-05-16T17:50:00+00:00",
+                end_at="2026-05-16T18:00:00+00:00",
+                label="Jarvis memory work",
+                category="Jarvis",
+                summary="Worked on structured session memory.",
+                key_actions=("Added key action memory",),
+                open_loops=("Verify prompt context",),
+                evidence_windows=("Code - server.py",),
+                event_count=10,
+                confidence=0.88,
+                summary_source="ollama",
+            )
+        ])
+
         prompt = build_ask_prompt(
             "what was I doing?",
             events,
             30,
+            session_context=session_context,
             timezone_name="America/Los_Angeles",
             location="unknown",
         )
@@ -84,33 +129,49 @@ class TimelinePromptTests(unittest.TestCase):
         self.assertIn("User question:\nwhat was I doing?", prompt)
         self.assertIn("Recent raw window timeline, last 30 minutes", prompt)
         self.assertIn("Safari - Ollama docs", prompt)
+        self.assertIn("Jarvis memory work", prompt)
+        self.assertIn("category: Jarvis", prompt)
+        self.assertIn("Key actions: Added key action memory", prompt)
+        self.assertIn("Open loops: Verify prompt context", prompt)
+        self.assertIn("Evidence windows: Code - server.py", prompt)
         self.assertIn("Do not invent details", prompt)
 
 
 class SmartSummaryTests(unittest.TestCase):
-    def test_parse_session_summary_response_uses_valid_json(self) -> None:
+    def test_parse_session_summary_response_uses_valid_structured_json(self) -> None:
         fallback = render_fallback_session()
 
-        label, summary = parse_session_summary_response(
-            '{"label":"Jarvis","summary":"Worked on Jarvis session memory."}',
+        session = parse_session_summary_response(
+            json.dumps({
+                "label": "Jarvis memory work",
+                "category": "Jarvis",
+                "summary": "Worked on Jarvis session memory.",
+                "key_actions": ["Added structured summary fields"],
+                "open_loops": ["Check ask prompt output"],
+                "evidence_windows": ["Code - memory.py"],
+                "confidence": 0.82,
+            }),
             fallback,
         )
 
-        self.assertEqual(label, "Jarvis")
-        self.assertEqual(summary, "Worked on Jarvis session memory.")
+        self.assertEqual(session.label, "Jarvis memory work")
+        self.assertEqual(session.category, "Jarvis")
+        self.assertEqual(session.summary, "Worked on Jarvis session memory.")
+        self.assertEqual(session.key_actions, ("Added structured summary fields",))
+        self.assertEqual(session.open_loops, ("Check ask prompt output",))
+        self.assertEqual(session.evidence_windows, ("Code - memory.py",))
+        self.assertEqual(session.confidence, 0.82)
+        self.assertEqual(session.summary_source, "ollama")
 
     def test_parse_session_summary_response_falls_back_on_invalid_json(self) -> None:
         fallback = render_fallback_session()
 
-        label, summary = parse_session_summary_response("not json", fallback)
+        session = parse_session_summary_response("not json", fallback)
 
-        self.assertEqual(label, fallback.label)
-        self.assertEqual(summary, fallback.summary)
+        self.assertEqual(session, fallback)
 
 
 def render_fallback_session():
-    from jarvis.mac_mini.memory import ActivitySession
-
     return ActivitySession(
         start_at="2026-05-16T18:00:00+00:00",
         end_at="2026-05-16T18:05:00+00:00",
@@ -118,6 +179,8 @@ def render_fallback_session():
         summary="Worked in coding tools: Terminal.",
         event_count=5,
         confidence=0.8,
+        category="Coding",
+        evidence_windows=("Terminal - jarvis",),
     )
 
 

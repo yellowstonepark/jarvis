@@ -18,6 +18,11 @@ class ActivitySession:
     event_count: int
     confidence: float
     summary_source: str = "heuristic"
+    category: str = "Unknown"
+    key_actions: tuple[str, ...] = ()
+    open_loops: tuple[str, ...] = ()
+    evidence_windows: tuple[str, ...] = ()
+    updated_at: str = ""
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -74,6 +79,11 @@ class MemoryStore:
                     event_count INTEGER NOT NULL,
                     confidence REAL NOT NULL,
                     summary_source TEXT NOT NULL DEFAULT 'heuristic',
+                    category TEXT NOT NULL DEFAULT 'Unknown',
+                    key_actions TEXT NOT NULL DEFAULT '[]',
+                    open_loops TEXT NOT NULL DEFAULT '[]',
+                    evidence_windows TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL DEFAULT '',
                     UNIQUE(start_at, end_at)
                 )
                 """
@@ -85,6 +95,11 @@ class MemoryStore:
                 """
             )
             ensure_column(connection, "sessions", "summary_source", "TEXT NOT NULL DEFAULT 'heuristic'")
+            ensure_column(connection, "sessions", "category", "TEXT NOT NULL DEFAULT 'Unknown'")
+            ensure_column(connection, "sessions", "key_actions", "TEXT NOT NULL DEFAULT '[]'")
+            ensure_column(connection, "sessions", "open_loops", "TEXT NOT NULL DEFAULT '[]'")
+            ensure_column(connection, "sessions", "evidence_windows", "TEXT NOT NULL DEFAULT '[]'")
+            ensure_column(connection, "sessions", "updated_at", "TEXT NOT NULL DEFAULT ''")
 
     def ingest_jsonl(self, path: Path) -> int:
         expanded_path = path.expanduser()
@@ -175,7 +190,7 @@ class MemoryStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT start_at, end_at, label, summary, event_count, confidence, summary_source
+                SELECT start_at, end_at, label, summary, event_count, confidence, summary_source, category, key_actions, open_loops, evidence_windows, updated_at
                 FROM sessions
                 WHERE end_at >= ?
                 ORDER BY start_at ASC
@@ -193,7 +208,7 @@ class MemoryStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT start_at, end_at, label, summary, event_count, confidence, summary_source
+                SELECT start_at, end_at, label, summary, event_count, confidence, summary_source, category, key_actions, open_loops, evidence_windows, updated_at
                 FROM sessions
                 WHERE end_at >= ? AND start_at <= ?
                 ORDER BY start_at ASC
@@ -220,8 +235,9 @@ class MemoryStore:
                 connection.execute(
                     """
                     INSERT OR REPLACE INTO sessions (
-                        start_at, end_at, label, summary, event_count, confidence, summary_source
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        start_at, end_at, label, summary, event_count, confidence,
+                        summary_source, category, key_actions, open_loops, evidence_windows, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         session.start_at,
@@ -231,6 +247,11 @@ class MemoryStore:
                         session.event_count,
                         session.confidence,
                         session.summary_source,
+                        session.category,
+                        encode_json_array(session.key_actions),
+                        encode_json_array(session.open_loops),
+                        encode_json_array(session.evidence_windows),
+                        session.updated_at,
                     ),
                 )
 
@@ -252,7 +273,7 @@ def existing_smart_session(
 ) -> ActivitySession | None:
     row = connection.execute(
         """
-        SELECT start_at, end_at, label, summary, event_count, confidence, summary_source
+        SELECT start_at, end_at, label, summary, event_count, confidence, summary_source, category, key_actions, open_loops, evidence_windows, updated_at
         FROM sessions
         WHERE start_at = ? AND end_at = ? AND summary_source = 'ollama'
         """,
@@ -284,6 +305,11 @@ def session_from_row(row: sqlite3.Row) -> ActivitySession:
         event_count=row["event_count"],
         confidence=row["confidence"],
         summary_source=row["summary_source"],
+        category=row["category"],
+        key_actions=decode_json_array(row["key_actions"]),
+        open_loops=decode_json_array(row["open_loops"]),
+        evidence_windows=decode_json_array(row["evidence_windows"]),
+        updated_at=row["updated_at"],
     )
 
 
@@ -380,6 +406,9 @@ def summarize_chunk(events: list[WindowSnapshot]) -> ActivitySession:
         event_count=len(events),
         confidence=confidence,
         summary_source="heuristic",
+        category=label,
+        evidence_windows=tuple(format_evidence_windows(events)),
+        updated_at=utc_now().isoformat(),
     )
 
 
@@ -437,6 +466,35 @@ def ordered_unique(values) -> list[str]:
     return result
 
 
+def encode_json_array(values: tuple[str, ...] | list[str]) -> str:
+    return json.dumps(list(values), separators=(",", ":"))
+
+
+def decode_json_array(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    cleaned = []
+    for item in parsed:
+        text = str(item).strip()
+        if text:
+            cleaned.append(text)
+    return tuple(cleaned)
+
+
+def format_evidence_windows(events: list[WindowSnapshot], max_windows: int = 6) -> list[str]:
+    windows = []
+    for event in events:
+        title = f" - {event.window_title}" if event.window_title else ""
+        windows.append(f"{event.app_name}{title}")
+    return ordered_unique(windows)[:max_windows]
+
+
 def render_sessions(sessions: list[ActivitySession]) -> str:
     if not sessions:
         return "No window activity found for that range."
@@ -458,7 +516,17 @@ def format_session_context(sessions: list[ActivitySession], max_sessions: int = 
     for session in sessions[-max_sessions:]:
         start = parse_timestamp(session.start_at).strftime("%H:%M")
         end = parse_timestamp(session.end_at).strftime("%H:%M")
-        lines.append(f"- {start}-{end} {session.label}: {session.summary}")
+        lines.append(
+            f"- {start}-{end} {session.label} "
+            f"(category: {session.category}, confidence: {session.confidence:.2f}): "
+            f"{session.summary}"
+        )
+        if session.key_actions:
+            lines.append(f"  Key actions: {'; '.join(session.key_actions)}")
+        if session.open_loops:
+            lines.append(f"  Open loops: {'; '.join(session.open_loops)}")
+        if session.evidence_windows:
+            lines.append(f"  Evidence windows: {'; '.join(session.evidence_windows)}")
     return "\n".join(lines)
 
 
@@ -468,6 +536,10 @@ def replace_session_summary(
     summary: str,
     confidence: float = 0.85,
     summary_source: str = "ollama",
+    category: str | None = None,
+    key_actions: tuple[str, ...] = (),
+    open_loops: tuple[str, ...] = (),
+    evidence_windows: tuple[str, ...] = (),
 ) -> ActivitySession:
     return ActivitySession(
         start_at=session.start_at,
@@ -477,6 +549,11 @@ def replace_session_summary(
         event_count=session.event_count,
         confidence=confidence,
         summary_source=summary_source,
+        category=category or session.category,
+        key_actions=key_actions,
+        open_loops=open_loops,
+        evidence_windows=evidence_windows or session.evidence_windows,
+        updated_at=utc_now().isoformat(),
     )
 
 

@@ -113,7 +113,7 @@ class State:
             for session in sessions:
                 if self._ask_active.is_set():
                     break
-                if session.summary_source == "ollama":
+                if session_has_structured_summary(session):
                     continue
 
                 try:
@@ -285,6 +285,11 @@ def build_handler(state: State, ollama: OllamaConfig):
 
 
 
+
+def session_has_structured_summary(session: ActivitySession) -> bool:
+    return session.summary_source == "ollama" and bool(session.evidence_windows)
+
+
 def summarize_session_with_ollama(
     session: ActivitySession,
     events: list[WindowSnapshot],
@@ -292,8 +297,7 @@ def summarize_session_with_ollama(
 ) -> ActivitySession:
     prompt = build_session_summary_prompt(session, events)
     response = complete_ollama_chat(prompt, config).strip()
-    label, summary = parse_session_summary_response(response, session)
-    return replace_session_summary(session, label=label, summary=summary)
+    return parse_session_summary_response(response, session)
 
 
 def build_session_summary_prompt(
@@ -305,37 +309,64 @@ def build_session_summary_prompt(
     end = parse_timestamp(session.end_at).strftime("%H:%M")
     return (
         "You summarize a short Mac activity session for Jarvis memory. "
-        "Use only the window timeline. Do not invent project names. "
+        "Use only the window timeline. Do not invent file contents, code changes, "
+        "project decisions, or tasks that are not visible from app/window titles. "
         "Prefer concrete work descriptions over app lists. If the timeline is vague, say so.\n\n"
-        "Allowed labels: Jarvis, Actuate, Shwaz, School, Admin, Coding, "
+        "Allowed labels/categories: Jarvis, Actuate, Shwaz, School, Admin, Coding, "
         "Browsing, Mixed/context switching, Unknown.\n\n"
         f"Time range: {start}-{end}\n"
         f"Heuristic label: {session.label}\n"
         f"Window timeline:\n{timeline}\n\n"
-        "Return exactly JSON with keys label and summary. "
+        "Return exactly one JSON object with keys: label, category, summary, "
+        "key_actions, open_loops, evidence_windows, confidence. "
+        "key_actions, open_loops, and evidence_windows must be arrays of short strings. "
+        "key_actions should describe visible activity, not inferred implementation details. "
+        "confidence must be a number from 0 to 1. Use empty arrays when unsure. "
         "The summary must be one concise sentence. Example: "
-        '{"label":"Jarvis","summary":"Worked on Jarvis memory code in Terminal and Code."}'
+        '{"label":"Jarvis memory work","category":"Jarvis",'
+        '"summary":"Worked on Jarvis memory code in Terminal and Code.",'
+        '"key_actions":["Worked in Code on memory.py"],"open_loops":[],'
+        '"evidence_windows":["Terminal - jarvis","Code - memory.py"],"confidence":0.82}'
     )
 
 
 def parse_session_summary_response(
     response: str,
     fallback: ActivitySession,
-) -> tuple[str, str]:
+) -> ActivitySession:
     try:
         data = json.loads(response)
-        label = clean_label(str(data["label"]), fallback.label)
-        summary = str(data["summary"]).strip()
-    except (KeyError, TypeError, json.JSONDecodeError):
-        return fallback.label, fallback.summary
+        label = clean_text(data["label"])
+        category = clean_category(clean_text(data.get("category", fallback.category)), fallback.category)
+        summary = clean_text(data["summary"])
+        key_actions = clean_string_array(data.get("key_actions", []), max_items=5)
+        open_loops = clean_string_array(data.get("open_loops", []), max_items=5)
+        evidence_windows = clean_string_array(data.get("evidence_windows", []), max_items=8)
+        confidence = clean_confidence(data.get("confidence", 0.85), fallback.confidence)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return fallback
 
-    if not summary:
-        return fallback.label, fallback.summary
+    if not label or not summary:
+        return fallback
 
-    return label, summary
+    return replace_session_summary(
+        fallback,
+        label=label[:80],
+        summary=summary[:300],
+        confidence=confidence,
+        summary_source="ollama",
+        category=category,
+        key_actions=key_actions,
+        open_loops=open_loops,
+        evidence_windows=evidence_windows or fallback.evidence_windows,
+    )
 
 
-def clean_label(label: str, fallback: str) -> str:
+def clean_text(value) -> str:
+    return str(value).strip()
+
+
+def clean_category(category: str, fallback: str) -> str:
     allowed = {
         "Jarvis",
         "Actuate",
@@ -347,8 +378,28 @@ def clean_label(label: str, fallback: str) -> str:
         "Mixed/context switching",
         "Unknown",
     }
-    normalized = label.strip()
+    normalized = category.strip()
     return normalized if normalized in allowed else fallback
+
+
+def clean_string_array(value, max_items: int) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    cleaned: list[str] = []
+    for item in value:
+        text = clean_text(item)
+        if text:
+            cleaned.append(text[:160])
+        if len(cleaned) >= max_items:
+            break
+    return tuple(cleaned)
+
+
+def clean_confidence(value, fallback: float) -> float:
+    confidence = float(value)
+    if confidence < 0 or confidence > 1:
+        return fallback
+    return round(confidence, 2)
 
 
 def complete_ollama_chat(prompt: str, config: OllamaConfig) -> str:
