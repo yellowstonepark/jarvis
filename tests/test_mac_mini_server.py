@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 import unittest.mock
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from jarvis.common.models import WindowSnapshot
@@ -29,6 +29,39 @@ class StateTests(unittest.TestCase):
             lines = event_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 1)
             self.assertEqual(json.loads(lines[0]), json.loads(snapshot.to_json()))
+
+    def test_ask_memory_context_dedupes_recent_and_retrieved_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            event_log = Path(tmpdir) / ".jarvis" / "window-events.jsonl"
+            db_path = Path(tmpdir) / ".jarvis" / "jarvis.sqlite"
+            state = State(event_log, db_path)
+            state.set_latest_window(
+                WindowSnapshot(
+                    "Code",
+                    "SQLite memory.py",
+                    datetime.now(timezone.utc).isoformat(),
+                    "macbook",
+                )
+            )
+            older = ActivitySession(
+                start_at="2026-05-15T18:00:00+00:00",
+                end_at="2026-05-15T18:05:00+00:00",
+                label="Older Jarvis SQLite memory",
+                category="Jarvis",
+                summary="Worked on older SQLite recall.",
+                event_count=5,
+                confidence=0.9,
+                summary_source="ollama",
+                key_actions=("Designed recall search",),
+                evidence_windows=("Code - server.py",),
+            )
+            state._memory.replace_sessions([older])
+
+            recent_context, relevant_context = state.ask_memory_context("SQLite memory", 30)
+
+            self.assertIn("SQLite memory.py", recent_context)
+            self.assertIn("Older Jarvis SQLite memory", relevant_context)
+            self.assertNotIn("SQLite memory.py", relevant_context)
 
 
 class MemoryStoreTests(unittest.TestCase):
@@ -79,6 +112,36 @@ class MemoryStoreTests(unittest.TestCase):
             self.assertEqual(stored[0].open_loops, ("Verify persistence",))
             self.assertEqual(stored[0].evidence_windows, ("Code - memory.py",))
 
+    def test_memory_store_indexes_sessions_into_fts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = MemoryStore(Path(tmpdir) / "jarvis.sqlite")
+            store.replace_sessions([
+                ActivitySession(
+                    start_at="2026-05-15T18:00:00+00:00",
+                    end_at="2026-05-15T18:20:00+00:00",
+                    label="Jarvis SQLite memory",
+                    category="Jarvis",
+                    summary="Worked on SQLite-backed searchable session memory.",
+                    event_count=20,
+                    confidence=0.9,
+                    summary_source="ollama",
+                    key_actions=("Added FTS indexing",),
+                    open_loops=("Verify recall from jarvis ask",),
+                    evidence_windows=("Code - memory.py",),
+                )
+            ])
+
+            matches = store.search_sessions("where did I leave off on SQLite memory?")
+
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0].label, "Jarvis SQLite memory")
+
+    def test_memory_store_search_empty_query_returns_no_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = MemoryStore(Path(tmpdir) / "jarvis.sqlite")
+
+            self.assertEqual(store.search_sessions("what was I doing?"), [])
+
 
 class TimelinePromptTests(unittest.TestCase):
     def test_format_window_timeline_compacts_repeated_windows(self) -> None:
@@ -114,11 +177,28 @@ class TimelinePromptTests(unittest.TestCase):
             )
         ])
 
+        relevant_session_context = format_session_context([
+            ActivitySession(
+                start_at="2026-05-15T17:50:00+00:00",
+                end_at="2026-05-15T18:00:00+00:00",
+                label="Older Jarvis SQLite work",
+                category="Jarvis",
+                summary="Worked on SQLite recall for Jarvis memory.",
+                key_actions=("Added FTS search",),
+                open_loops=("Try jarvis ask recall",),
+                evidence_windows=("Code - memory.py",),
+                event_count=10,
+                confidence=0.84,
+                summary_source="ollama",
+            )
+        ])
+
         prompt = build_ask_prompt(
             "what was I doing?",
             events,
             30,
             session_context=session_context,
+            relevant_session_context=relevant_session_context,
             timezone_name="America/Los_Angeles",
             location="unknown",
         )
@@ -134,7 +214,21 @@ class TimelinePromptTests(unittest.TestCase):
         self.assertIn("Key actions: Added key action memory", prompt)
         self.assertIn("Open loops: Verify prompt context", prompt)
         self.assertIn("Evidence windows: Code - server.py", prompt)
+        self.assertIn("Relevant older session memories", prompt)
+        self.assertIn("Older Jarvis SQLite work", prompt)
+        self.assertIn("Key actions: Added FTS search", prompt)
         self.assertIn("Do not invent details", prompt)
+
+    def test_build_ask_prompt_falls_back_when_no_relevant_memories(self) -> None:
+        prompt = build_ask_prompt(
+            "what was I doing?",
+            [],
+            30,
+            session_context="- 18:00-18:05 Jarvis: Worked on Jarvis.",
+        )
+
+        self.assertIn("Relevant older session memories", prompt)
+        self.assertIn("No older matching session memories were found", prompt)
 
 
 class SmartSummaryTests(unittest.TestCase):

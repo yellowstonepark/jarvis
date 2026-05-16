@@ -84,12 +84,21 @@ class State:
     def end_interactive_request(self) -> None:
         self._ask_active.clear()
 
-    def recent_session_context(self, minutes: float) -> str:
+    def ask_memory_context(self, question: str, minutes: float) -> tuple[str, str]:
         end_at = datetime.now(timezone.utc)
         start_at = end_at - timedelta(minutes=minutes)
         with self._lock:
-            sessions = self._memory.build_sessions(start_at, end_at)
-        return format_session_context(sessions)
+            recent_sessions = self._memory.build_sessions(start_at, end_at)
+            relevant_sessions = self._memory.search_sessions(question, limit=6)
+
+        recent_keys = session_keys(recent_sessions)
+        older_relevant_sessions = [
+            session for session in relevant_sessions if session_key(session) not in recent_keys
+        ]
+        return (
+            format_session_context(recent_sessions),
+            format_session_context(older_relevant_sessions),
+        )
 
     def refresh_summaries(
         self,
@@ -240,13 +249,16 @@ def build_handler(state: State, ollama: OllamaConfig):
             try:
                 if with_window_history:
                     events = state.recent_window_events(history_minutes)
-                    session_context = state.recent_session_context(history_minutes)
+                    session_context, relevant_session_context = state.ask_memory_context(
+                        prompt, history_minutes
+                    )
                     prompt = build_ask_prompt(
                         prompt,
                         events,
                         history_minutes,
                         max_history_events,
                         session_context,
+                        relevant_session_context,
                         timezone_name=timezone_name,
                         location=location,
                     )
@@ -284,6 +296,14 @@ def build_handler(state: State, ollama: OllamaConfig):
 
 
 
+
+
+def session_key(session: ActivitySession) -> tuple[str, str]:
+    return (session.start_at, session.end_at)
+
+
+def session_keys(sessions: list[ActivitySession]) -> set[tuple[str, str]]:
+    return {session_key(session) for session in sessions}
 
 
 def session_has_structured_summary(session: ActivitySession) -> bool:
@@ -444,6 +464,7 @@ def build_ask_prompt(
     history_minutes: float,
     max_segments: int = 80,
     session_context: str = "",
+    relevant_session_context: str = "",
     timezone_name: str | None = None,
     location: str | None = None,
 ) -> str:
@@ -452,19 +473,24 @@ def build_ask_prompt(
         timeline = "- No recent window events were recorded."
 
     if not session_context:
-        session_context = "- No session summaries are available yet."
+        session_context = "- No recent session summaries are available yet."
+
+    if not relevant_session_context:
+        relevant_session_context = "- No older matching session memories were found."
 
     context = build_environment_context(timezone_name, location)
 
     return (
         "You are Jarvis, a concise local assistant. Answer the user using only "
-        "the session summaries and recent window timeline below when the question "
+        "the session memories and recent window timeline below when the question "
         "asks about activity, focus, apps, projects, or recent work. Prefer "
-        "session summaries for higher-level answers and raw events for details. "
+        "relevant older session memories when the question names a topic from the past, "
+        "recent session summaries for current context, and raw events for details. "
         "If the context is insufficient, say what is missing. Do not invent details.\n\n"
         f"Current context:\n{context}\n\n"
         f"User question:\n{question.strip()}\n\n"
         f"Recent session summaries, last {history_minutes:g} minutes:\n{session_context}\n\n"
+        f"Relevant older session memories:\n{relevant_session_context}\n\n"
         f"Recent raw window timeline, last {history_minutes:g} minutes:\n{timeline}\n\n"
         "Answer concisely."
     )

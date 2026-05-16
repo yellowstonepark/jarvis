@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import re
 import sqlite3
 
 from jarvis.common.models import WindowSnapshot
@@ -41,6 +42,7 @@ class MemoryStore:
     def __init__(self, db_path: Path) -> None:
         self.path = db_path.expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fts_available = False
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -100,6 +102,46 @@ class MemoryStore:
             ensure_column(connection, "sessions", "open_loops", "TEXT NOT NULL DEFAULT '[]'")
             ensure_column(connection, "sessions", "evidence_windows", "TEXT NOT NULL DEFAULT '[]'")
             ensure_column(connection, "sessions", "updated_at", "TEXT NOT NULL DEFAULT ''")
+            self._initialize_session_fts(connection)
+
+    def _initialize_session_fts(self, connection: sqlite3.Connection) -> None:
+        try:
+            connection.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5(
+                    session_id UNINDEXED,
+                    start_at UNINDEXED,
+                    end_at UNINDEXED,
+                    label,
+                    category,
+                    summary,
+                    key_actions,
+                    open_loops,
+                    evidence_windows
+                )
+                """
+            )
+        except sqlite3.OperationalError:
+            self._fts_available = False
+            return
+
+        self._fts_available = True
+        self._rebuild_session_fts(connection)
+
+    def _rebuild_session_fts(self, connection: sqlite3.Connection) -> None:
+        if not self._fts_available:
+            return
+
+        connection.execute("DELETE FROM session_fts")
+        rows = connection.execute(
+            """
+            SELECT id, start_at, end_at, label, summary, category,
+                   key_actions, open_loops, evidence_windows
+            FROM sessions
+            """
+        ).fetchall()
+        for row in rows:
+            insert_session_fts_row(connection, row)
 
     def ingest_jsonl(self, path: Path) -> int:
         expanded_path = path.expanduser()
@@ -232,7 +274,7 @@ class MemoryStore:
                     "DELETE FROM sessions WHERE start_at = ? AND end_at = ?",
                     (session.start_at, session.end_at),
                 )
-                connection.execute(
+                cursor = connection.execute(
                     """
                     INSERT OR REPLACE INTO sessions (
                         start_at, end_at, label, summary, event_count, confidence,
@@ -254,6 +296,40 @@ class MemoryStore:
                         session.updated_at,
                     ),
                 )
+                if self._fts_available:
+                    connection.execute(
+                        "DELETE FROM session_fts WHERE start_at = ? AND end_at = ?",
+                        (session.start_at, session.end_at),
+                    )
+                    insert_session_fts_session(connection, cursor.lastrowid, session)
+
+    def search_sessions(self, query: str, limit: int = 6) -> list[ActivitySession]:
+        if not self._fts_available:
+            return []
+
+        match_query = build_fts_query(query)
+        if not match_query:
+            return []
+
+        with self._connect() as connection:
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT s.start_at, s.end_at, s.label, s.summary, s.event_count,
+                           s.confidence, s.summary_source, s.category, s.key_actions,
+                           s.open_loops, s.evidence_windows, s.updated_at
+                    FROM session_fts
+                    JOIN sessions s ON s.id = session_fts.session_id
+                    WHERE session_fts MATCH ?
+                    ORDER BY bm25(session_fts), s.end_at DESC
+                    LIMIT ?
+                    """,
+                    (match_query, limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+
+        return dedupe_sessions([session_from_row(row) for row in rows])
 
 
 def ensure_column(
@@ -265,6 +341,83 @@ def ensure_column(
     columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
     if column not in columns:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def insert_session_fts_row(connection: sqlite3.Connection, row: sqlite3.Row) -> None:
+    connection.execute(
+        """
+        INSERT INTO session_fts (
+            session_id, start_at, end_at, label, category, summary,
+            key_actions, open_loops, evidence_windows
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row["id"],
+            row["start_at"],
+            row["end_at"],
+            row["label"],
+            row["category"],
+            row["summary"],
+            row["key_actions"],
+            row["open_loops"],
+            row["evidence_windows"],
+        ),
+    )
+
+
+def insert_session_fts_session(
+    connection: sqlite3.Connection,
+    session_id: int,
+    session: ActivitySession,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO session_fts (
+            session_id, start_at, end_at, label, category, summary,
+            key_actions, open_loops, evidence_windows
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            session.start_at,
+            session.end_at,
+            session.label,
+            session.category,
+            session.summary,
+            " ".join(session.key_actions),
+            " ".join(session.open_loops),
+            " ".join(session.evidence_windows),
+        ),
+    )
+
+
+def build_fts_query(query: str) -> str:
+    stop_words = {
+        "about",
+        "again",
+        "could",
+        "doing",
+        "from",
+        "have",
+        "leave",
+        "left",
+        "like",
+        "what",
+        "when",
+        "where",
+        "with",
+        "work",
+        "worked",
+        "working",
+    }
+    tokens = []
+    for token in re.findall(r"[A-Za-z0-9_]+", query.lower()):
+        if len(token) < 3 or token in stop_words:
+            continue
+        tokens.append(token)
+
+    unique_tokens = ordered_unique(tokens)[:8]
+    return " OR ".join(f'"{token}"' for token in unique_tokens)
 
 
 def existing_smart_session(
