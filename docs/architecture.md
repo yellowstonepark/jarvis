@@ -43,7 +43,7 @@ The Mac mini keeps JSONL as an append-only backup and stores queryable memory in
 - `window_events`: one row per observed active-window event.
 - `sessions`: on-demand session chunks with label, summary, event count, and confidence.
 
-`POST /v1/recap` builds session chunks for a requested time range and returns a text recap. The MacBook CLI exposes this as `jarvis recap`, `jarvis recap --last 2h`, and `jarvis recap --today`.
+A background summary worker periodically builds stable session chunks, removes consecutive duplicate windows from the summary prompt, asks Ollama for concise JSON summaries, and caches the result with `summary_source = 'ollama'`. Event ingestion never calls Ollama. `jarvis ask` does not generate summaries synchronously; it consumes cached summaries and recent raw events. If an ask is active, the background worker skips starting new summary work and stops before the next session.
 
 ## Communication Direction
 

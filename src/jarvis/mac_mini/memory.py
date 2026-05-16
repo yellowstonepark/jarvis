@@ -17,6 +17,7 @@ class ActivitySession:
     summary: str
     event_count: int
     confidence: float
+    summary_source: str = "heuristic"
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -72,7 +73,8 @@ class MemoryStore:
                     summary TEXT NOT NULL,
                     event_count INTEGER NOT NULL,
                     confidence REAL NOT NULL,
-                    UNIQUE(start_at, end_at, label)
+                    summary_source TEXT NOT NULL DEFAULT 'heuristic',
+                    UNIQUE(start_at, end_at)
                 )
                 """
             )
@@ -82,6 +84,7 @@ class MemoryStore:
                 ON sessions(start_at)
                 """
             )
+            ensure_column(connection, "sessions", "summary_source", "TEXT NOT NULL DEFAULT 'heuristic'")
 
     def ingest_jsonl(self, path: Path) -> int:
         expanded_path = path.expanduser()
@@ -150,6 +153,12 @@ class MemoryStore:
         end_at = utc_now()
         return self.window_events_between(end_at - timedelta(minutes=minutes), end_at)
 
+    def window_events_for_session(self, session: ActivitySession) -> list[WindowSnapshot]:
+        return self.window_events_between(
+            parse_timestamp(session.start_at),
+            parse_timestamp(session.end_at),
+        )
+
     def build_sessions(
         self,
         start_at: datetime,
@@ -166,7 +175,7 @@ class MemoryStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT start_at, end_at, label, summary, event_count, confidence
+                SELECT start_at, end_at, label, summary, event_count, confidence, summary_source
                 FROM sessions
                 WHERE end_at >= ?
                 ORDER BY start_at ASC
@@ -174,7 +183,25 @@ class MemoryStore:
                 (start_at.isoformat(),),
             ).fetchall()
 
-        return [session_from_row(row) for row in rows]
+        return dedupe_sessions([session_from_row(row) for row in rows])
+
+    def stored_sessions_between(
+        self,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[ActivitySession]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT start_at, end_at, label, summary, event_count, confidence, summary_source
+                FROM sessions
+                WHERE end_at >= ? AND start_at <= ?
+                ORDER BY start_at ASC
+                """,
+                (start_at.isoformat(), end_at.isoformat()),
+            ).fetchall()
+
+        return dedupe_sessions([session_from_row(row) for row in rows])
 
     def replace_sessions(self, sessions: list[ActivitySession]) -> None:
         if not sessions:
@@ -182,11 +209,19 @@ class MemoryStore:
 
         with self._connect() as connection:
             for session in sessions:
+                existing = existing_smart_session(connection, session)
+                if existing is not None and session.summary_source == "heuristic":
+                    session = existing
+
+                connection.execute(
+                    "DELETE FROM sessions WHERE start_at = ? AND end_at = ?",
+                    (session.start_at, session.end_at),
+                )
                 connection.execute(
                     """
                     INSERT OR REPLACE INTO sessions (
-                        start_at, end_at, label, summary, event_count, confidence
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        start_at, end_at, label, summary, event_count, confidence, summary_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         session.start_at,
@@ -195,8 +230,49 @@ class MemoryStore:
                         session.summary,
                         session.event_count,
                         session.confidence,
+                        session.summary_source,
                     ),
                 )
+
+
+def ensure_column(
+    connection: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def existing_smart_session(
+    connection: sqlite3.Connection,
+    session: ActivitySession,
+) -> ActivitySession | None:
+    row = connection.execute(
+        """
+        SELECT start_at, end_at, label, summary, event_count, confidence, summary_source
+        FROM sessions
+        WHERE start_at = ? AND end_at = ? AND summary_source = 'ollama'
+        """,
+        (session.start_at, session.end_at),
+    ).fetchone()
+    if row is None:
+        return None
+    return session_from_row(row)
+
+
+def dedupe_sessions(sessions: list[ActivitySession]) -> list[ActivitySession]:
+    by_range: dict[tuple[str, str], ActivitySession] = {}
+    for session in sessions:
+        key = (session.start_at, session.end_at)
+        existing = by_range.get(key)
+        if existing is None or (
+            existing.summary_source != "ollama" and session.summary_source == "ollama"
+        ):
+            by_range[key] = session
+    return sorted(by_range.values(), key=lambda session: session.start_at)
 
 
 def session_from_row(row: sqlite3.Row) -> ActivitySession:
@@ -207,6 +283,7 @@ def session_from_row(row: sqlite3.Row) -> ActivitySession:
         summary=row["summary"],
         event_count=row["event_count"],
         confidence=row["confidence"],
+        summary_source=row["summary_source"],
     )
 
 
@@ -302,6 +379,7 @@ def summarize_chunk(events: list[WindowSnapshot]) -> ActivitySession:
         summary=summary,
         event_count=len(events),
         confidence=confidence,
+        summary_source="heuristic",
     )
 
 
@@ -359,7 +437,7 @@ def ordered_unique(values) -> list[str]:
     return result
 
 
-def render_recap(sessions: list[ActivitySession]) -> str:
+def render_sessions(sessions: list[ActivitySession]) -> str:
     if not sessions:
         return "No window activity found for that range."
 
@@ -381,4 +459,44 @@ def format_session_context(sessions: list[ActivitySession], max_sessions: int = 
         start = parse_timestamp(session.start_at).strftime("%H:%M")
         end = parse_timestamp(session.end_at).strftime("%H:%M")
         lines.append(f"- {start}-{end} {session.label}: {session.summary}")
+    return "\n".join(lines)
+
+
+def replace_session_summary(
+    session: ActivitySession,
+    label: str,
+    summary: str,
+    confidence: float = 0.85,
+    summary_source: str = "ollama",
+) -> ActivitySession:
+    return ActivitySession(
+        start_at=session.start_at,
+        end_at=session.end_at,
+        label=label,
+        summary=summary,
+        event_count=session.event_count,
+        confidence=confidence,
+        summary_source=summary_source,
+    )
+
+
+def format_events_for_summary(events: list[WindowSnapshot], max_events: int = 80) -> str:
+    if not events:
+        return "- No events"
+
+    compacted: list[WindowSnapshot] = []
+    previous_key: tuple[str, str | None] | None = None
+    for event in sorted(events, key=lambda item: parse_timestamp(item.observed_at)):
+        key = (event.app_name, event.window_title)
+        if key == previous_key:
+            continue
+        compacted.append(event)
+        previous_key = key
+
+    compacted = compacted[-max_events:]
+    lines = []
+    for event in compacted:
+        observed_at = parse_timestamp(event.observed_at).strftime("%H:%M")
+        title = f" - {event.window_title}" if event.window_title else ""
+        lines.append(f"- {observed_at} {event.app_name}{title}")
     return "\n".join(lines)

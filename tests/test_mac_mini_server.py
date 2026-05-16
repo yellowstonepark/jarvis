@@ -6,8 +6,8 @@ from datetime import datetime
 from pathlib import Path
 
 from jarvis.common.models import WindowSnapshot
-from jarvis.mac_mini.server import OllamaConfig, State, build_ask_prompt, format_window_timeline, open_ollama_chat
-from jarvis.mac_mini.memory import MemoryStore, render_recap
+from jarvis.mac_mini.server import OllamaConfig, State, build_ask_prompt, format_window_timeline, open_ollama_chat, parse_session_summary_response
+from jarvis.mac_mini.memory import MemoryStore, render_sessions
 
 
 class StateTests(unittest.TestCase):
@@ -32,7 +32,7 @@ class StateTests(unittest.TestCase):
 
 
 class MemoryStoreTests(unittest.TestCase):
-    def test_memory_store_persists_window_events_and_builds_recap(self) -> None:
+    def test_memory_store_persists_window_events_and_builds_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = MemoryStore(Path(tmpdir) / "jarvis.sqlite")
             store.insert_window_event(
@@ -47,9 +47,9 @@ class MemoryStoreTests(unittest.TestCase):
                 datetime.fromisoformat("2026-05-16T18:02:00+00:00"),
             )
 
-            recap = render_recap(sessions)
-            self.assertIn("18:00-18:01", recap)
-            self.assertIn("Jarvis", recap)
+            rendered_sessions = render_sessions(sessions)
+            self.assertIn("18:00-18:01", rendered_sessions)
+            self.assertIn("Jarvis", rendered_sessions)
 
 
 class TimelinePromptTests(unittest.TestCase):
@@ -76,6 +76,40 @@ class TimelinePromptTests(unittest.TestCase):
         self.assertIn("Recent raw window timeline, last 30 minutes", prompt)
         self.assertIn("Safari - Ollama docs", prompt)
         self.assertIn("Do not invent details", prompt)
+
+
+class SmartSummaryTests(unittest.TestCase):
+    def test_parse_session_summary_response_uses_valid_json(self) -> None:
+        fallback = render_fallback_session()
+
+        label, summary = parse_session_summary_response(
+            '{"label":"Jarvis","summary":"Worked on Jarvis session memory."}',
+            fallback,
+        )
+
+        self.assertEqual(label, "Jarvis")
+        self.assertEqual(summary, "Worked on Jarvis session memory.")
+
+    def test_parse_session_summary_response_falls_back_on_invalid_json(self) -> None:
+        fallback = render_fallback_session()
+
+        label, summary = parse_session_summary_response("not json", fallback)
+
+        self.assertEqual(label, fallback.label)
+        self.assertEqual(summary, fallback.summary)
+
+
+def render_fallback_session():
+    from jarvis.mac_mini.memory import ActivitySession
+
+    return ActivitySession(
+        start_at="2026-05-16T18:00:00+00:00",
+        end_at="2026-05-16T18:05:00+00:00",
+        label="Coding",
+        summary="Worked in coding tools: Terminal.",
+        event_count=5,
+        confidence=0.8,
+    )
 
 
 class OllamaChatTests(unittest.TestCase):

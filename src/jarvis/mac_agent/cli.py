@@ -7,11 +7,8 @@ import time
 from jarvis.mac_agent.client import (
     AskClient,
     AskStreamError,
-    RecapClient,
-    RecapError,
     WindowEventClient,
     WindowEventSendError,
-    default_recap_endpoint,
     default_receiver_endpoint,
 )
 from jarvis.mac_agent.window import ActiveWindowError, get_active_window
@@ -61,9 +58,6 @@ def main(argv: list[str] | None = None) -> int:
     if raw_args and raw_args[0] == "ask":
         return ask(raw_args[1:])
 
-    if raw_args and raw_args[0] == "recap":
-        return recap(raw_args[1:])
-
     args = build_parser().parse_args(raw_args)
 
     if args.interval <= 0:
@@ -87,92 +81,6 @@ def main(argv: list[str] | None = None) -> int:
     except ActiveWindowError as error:
         print(format_error(error), file=sys.stderr)
         return 1
-
-
-
-def recap(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
-        prog="jarvis recap",
-        description="Summarize recent Jarvis window sessions.",
-    )
-    parser.add_argument(
-        "--recap-url",
-        help="Jarvis recap endpoint. Defaults to JARVIS_RECAP_URL or ~/.jarvis/receiver-url converted to /v1/recap.",
-    )
-    parser.add_argument(
-        "--last",
-        default="2h",
-        help="Range to recap, such as 30m, 2h, or 1d. Default: 2h.",
-    )
-    parser.add_argument(
-        "--today",
-        action="store_true",
-        help="Recap since local midnight. Overrides --last.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=30.0,
-        help="Receiver timeout in seconds. Default: 30.0.",
-    )
-    args = parser.parse_args(argv)
-
-    if args.timeout <= 0:
-        print("--timeout must be greater than 0.", file=sys.stderr)
-        return 2
-
-    try:
-        minutes = minutes_since_midnight() if args.today else parse_duration_minutes(args.last)
-    except ValueError as error:
-        print(str(error), file=sys.stderr)
-        return 2
-
-    endpoint = args.recap_url or default_recap_endpoint()
-    if endpoint is None:
-        print(
-            "No Jarvis recap endpoint configured. Set ~/.jarvis/receiver-url or pass --recap-url.",
-            file=sys.stderr,
-        )
-        return 2
-
-    try:
-        print(RecapClient(endpoint, args.timeout).recap(minutes))
-        return 0
-    except RecapError as error:
-        print(f"failed to recap Jarvis: {error}", file=sys.stderr)
-        return 1
-
-
-def parse_duration_minutes(value: str) -> float:
-    value = value.strip().lower()
-    if not value:
-        raise ValueError("--last must not be empty")
-
-    unit = value[-1]
-    number_text = value[:-1] if unit in {"m", "h", "d"} else value
-    try:
-        number = float(number_text)
-    except ValueError as error:
-        raise ValueError("--last must be a duration like 30m, 2h, or 1d") from error
-
-    if number <= 0:
-        raise ValueError("--last must be greater than 0")
-
-    if unit == "m" or unit.isdigit():
-        return number
-    if unit == "h":
-        return number * 60
-    if unit == "d":
-        return number * 24 * 60
-    raise ValueError("--last must use m, h, or d")
-
-
-def minutes_since_midnight() -> float:
-    from datetime import datetime
-
-    now = datetime.now()
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    return max((now - midnight).total_seconds() / 60, 1)
 
 
 def ask(argv: list[str]) -> int:

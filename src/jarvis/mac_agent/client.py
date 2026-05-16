@@ -157,6 +157,7 @@ class AskClient:
         with_window_history: bool = True,
         history_minutes: float = 30,
         max_history_events: int = 80,
+        smart_summaries: bool = True,
     ) -> None:
         body = json.dumps(
             {
@@ -164,6 +165,7 @@ class AskClient:
                 "with_window_history": with_window_history,
                 "history_minutes": history_minutes,
                 "max_history_events": max_history_events,
+                "smart_summaries": smart_summaries,
             },
             separators=(",", ":"),
         ).encode("utf-8")
@@ -194,65 +196,3 @@ class AskClient:
             raise AskStreamError(f"could not reach receiver: {error.reason}") from error
         except TimeoutError as error:
             raise AskStreamError("timed out waiting for receiver") from error
-
-
-
-class RecapError(Exception):
-    """Raised when Jarvis cannot fetch a recap from the receiver."""
-
-
-def recap_endpoint_from_receiver_url(receiver_url: str) -> str:
-    if receiver_url.endswith("/v1/window/events"):
-        return receiver_url[: -len("/v1/window/events")] + "/v1/recap"
-    if receiver_url.endswith("/v1/ask"):
-        return receiver_url[: -len("/v1/ask")] + "/v1/recap"
-    return receiver_url.rstrip("/") + "/v1/recap"
-
-
-def default_recap_endpoint() -> str | None:
-    explicit_recap_url = os.environ.get("JARVIS_RECAP_URL")
-    if explicit_recap_url:
-        return explicit_recap_url
-
-    receiver_url = os.environ.get("JARVIS_RECEIVER_URL")
-    if receiver_url:
-        return recap_endpoint_from_receiver_url(receiver_url)
-
-    receiver_file = Path.home() / ".jarvis" / "receiver-url"
-    if not receiver_file.exists():
-        return None
-
-    receiver_url = receiver_file.read_text(encoding="utf-8").strip()
-    if not receiver_url:
-        return None
-
-    return recap_endpoint_from_receiver_url(receiver_url)
-
-
-@dataclass(frozen=True)
-class RecapClient:
-    endpoint: str
-    timeout: float = 30.0
-
-    def recap(self, minutes: float) -> str:
-        body = json.dumps({"minutes": minutes}, separators=(",", ":")).encode("utf-8")
-        request = Request(
-            self.endpoint,
-            data=body,
-            headers={"content-type": "application/json"},
-            method="POST",
-        )
-
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-                return payload["recap"]
-        except HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            raise RecapError(f"receiver returned HTTP {error.code}: {detail}") from error
-        except URLError as error:
-            raise RecapError(f"could not reach receiver: {error.reason}") from error
-        except (KeyError, json.JSONDecodeError) as error:
-            raise RecapError(f"invalid recap response: {error}") from error
-        except TimeoutError as error:
-            raise RecapError("timed out waiting for receiver") from error

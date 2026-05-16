@@ -12,7 +12,13 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from jarvis.common.models import WindowSnapshot
-from jarvis.mac_mini.memory import MemoryStore, format_session_context, render_recap
+from jarvis.mac_mini.memory import (
+    ActivitySession,
+    MemoryStore,
+    format_events_for_summary,
+    format_session_context,
+    replace_session_summary,
+)
 
 
 class OllamaChatError(Exception):
@@ -30,6 +36,13 @@ class OllamaConfig:
         return f"{self.base_url.rstrip('/')}/api/chat"
 
 
+@dataclass(frozen=True)
+class SummaryConfig:
+    interval_seconds: float
+    lookback_minutes: float
+    stable_after_minutes: float
+
+
 class State:
     def __init__(self, event_log: Path, db_path: Path) -> None:
         self._lock = threading.Lock()
@@ -37,6 +50,8 @@ class State:
         self._event_log = event_log.expanduser()
         self._memory = MemoryStore(db_path)
         self._memory.ingest_jsonl(self._event_log)
+        self._ask_active = threading.Event()
+        self._summary_lock = threading.Lock()
 
     def set_latest_window(self, snapshot: WindowSnapshot) -> None:
         with self._lock:
@@ -62,12 +77,11 @@ class State:
         with self._lock:
             return self._memory.recent_window_events(minutes)
 
-    def recap(self, minutes: float) -> str:
-        end_at = datetime.now(timezone.utc)
-        start_at = end_at - timedelta(minutes=minutes)
-        with self._lock:
-            sessions = self._memory.build_sessions(start_at, end_at)
-        return render_recap(sessions)
+    def begin_interactive_request(self) -> None:
+        self._ask_active.set()
+
+    def end_interactive_request(self) -> None:
+        self._ask_active.clear()
 
     def recent_session_context(self, minutes: float) -> str:
         end_at = datetime.now(timezone.utc)
@@ -75,6 +89,49 @@ class State:
         with self._lock:
             sessions = self._memory.build_sessions(start_at, end_at)
         return format_session_context(sessions)
+
+    def refresh_summaries(
+        self,
+        ollama: OllamaConfig,
+        lookback_minutes: float,
+        stable_after_minutes: float,
+    ) -> int:
+        if self._ask_active.is_set():
+            return 0
+
+        if not self._summary_lock.acquire(blocking=False):
+            return 0
+
+        try:
+            end_at = datetime.now(timezone.utc) - timedelta(minutes=stable_after_minutes)
+            start_at = end_at - timedelta(minutes=lookback_minutes)
+            with self._lock:
+                sessions = self._memory.build_sessions(start_at, end_at)
+
+            updated: list[ActivitySession] = []
+            for session in sessions:
+                if self._ask_active.is_set():
+                    break
+                if session.summary_source == "ollama":
+                    continue
+
+                try:
+                    events = self.window_events_for_session(session)
+                    updated.append(summarize_session_with_ollama(session, events, ollama))
+                except OllamaChatError:
+                    continue
+
+            if updated:
+                with self._lock:
+                    self._memory.replace_sessions(updated)
+
+            return len(updated)
+        finally:
+            self._summary_lock.release()
+
+    def window_events_for_session(self, session: ActivitySession) -> list[WindowSnapshot]:
+        with self._lock:
+            return self._memory.window_events_for_session(session)
 
     def _append_event(self, snapshot: WindowSnapshot) -> None:
         self._event_log.parent.mkdir(parents=True, exist_ok=True)
@@ -120,10 +177,6 @@ def build_handler(state: State, ollama: OllamaConfig):
                 self.handle_ask()
                 return
 
-            if self.path == "/v1/recap":
-                self.handle_recap()
-                return
-
             self.write_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
         def handle_window_event(self) -> None:
@@ -141,23 +194,6 @@ def build_handler(state: State, ollama: OllamaConfig):
 
             state.set_latest_window(snapshot)
             self.write_json(HTTPStatus.ACCEPTED, {"ok": True})
-
-        def handle_recap(self) -> None:
-            length = int(self.headers.get("content-length", "0"))
-            raw_body = self.rfile.read(length).decode("utf-8")
-
-            try:
-                payload = json.loads(raw_body) if raw_body else {}
-                minutes = float(payload.get("minutes", 120))
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
-                self.write_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid recap payload: {error}"})
-                return
-
-            if minutes <= 0:
-                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "minutes must be greater than 0"})
-                return
-
-            self.write_json(HTTPStatus.OK, {"recap": state.recap(minutes)})
 
         def handle_ask(self) -> None:
             length = int(self.headers.get("content-length", "0"))
@@ -189,31 +225,35 @@ def build_handler(state: State, ollama: OllamaConfig):
                 self.write_json(HTTPStatus.BAD_REQUEST, {"error": "max_history_events must be greater than 0"})
                 return
 
-            if with_window_history:
-                events = state.recent_window_events(history_minutes)
-                session_context = state.recent_session_context(history_minutes)
-                prompt = build_ask_prompt(
-                    prompt,
-                    events,
-                    history_minutes,
-                    max_history_events,
-                    session_context,
-                )
-
+            state.begin_interactive_request()
             try:
-                ollama_response = open_ollama_chat(prompt, ollama)
-            except OllamaChatError as error:
-                self.write_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
-                return
+                if with_window_history:
+                    events = state.recent_window_events(history_minutes)
+                    session_context = state.recent_session_context(history_minutes)
+                    prompt = build_ask_prompt(
+                        prompt,
+                        events,
+                        history_minutes,
+                        max_history_events,
+                        session_context,
+                    )
 
-            with ollama_response:
-                self.send_response(HTTPStatus.OK)
-                self.send_header("content-type", "text/plain; charset=utf-8")
-                self.end_headers()
+                try:
+                    ollama_response = open_ollama_chat(prompt, ollama)
+                except OllamaChatError as error:
+                    self.write_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+                    return
 
-                for chunk in iter_ollama_content(ollama_response):
-                    self.wfile.write(chunk.encode("utf-8"))
-                    self.wfile.flush()
+                with ollama_response:
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("content-type", "text/plain; charset=utf-8")
+                    self.end_headers()
+
+                    for chunk in iter_ollama_content(ollama_response):
+                        self.wfile.write(chunk.encode("utf-8"))
+                        self.wfile.flush()
+            finally:
+                state.end_interactive_request()
 
         def log_message(self, format: str, *args) -> None:
             return
@@ -229,6 +269,109 @@ def build_handler(state: State, ollama: OllamaConfig):
     return JarvisMiniHandler
 
 
+
+
+
+def summarize_session_with_ollama(
+    session: ActivitySession,
+    events: list[WindowSnapshot],
+    config: OllamaConfig,
+) -> ActivitySession:
+    prompt = build_session_summary_prompt(session, events)
+    response = complete_ollama_chat(prompt, config).strip()
+    label, summary = parse_session_summary_response(response, session)
+    return replace_session_summary(session, label=label, summary=summary)
+
+
+def build_session_summary_prompt(
+    session: ActivitySession,
+    events: list[WindowSnapshot],
+) -> str:
+    timeline = format_events_for_summary(events)
+    start = parse_timestamp(session.start_at).strftime("%H:%M")
+    end = parse_timestamp(session.end_at).strftime("%H:%M")
+    return (
+        "You summarize a short Mac activity session for Jarvis memory. "
+        "Use only the window timeline. Do not invent project names. "
+        "Prefer concrete work descriptions over app lists. If the timeline is vague, say so.\n\n"
+        "Allowed labels: Jarvis, Actuate, Shwaz, School, Admin, Coding, "
+        "Browsing, Mixed/context switching, Unknown.\n\n"
+        f"Time range: {start}-{end}\n"
+        f"Heuristic label: {session.label}\n"
+        f"Window timeline:\n{timeline}\n\n"
+        "Return exactly JSON with keys label and summary. "
+        "The summary must be one concise sentence. Example: "
+        '{"label":"Jarvis","summary":"Worked on Jarvis memory code in Terminal and Code."}'
+    )
+
+
+def parse_session_summary_response(
+    response: str,
+    fallback: ActivitySession,
+) -> tuple[str, str]:
+    try:
+        data = json.loads(response)
+        label = clean_label(str(data["label"]), fallback.label)
+        summary = str(data["summary"]).strip()
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return fallback.label, fallback.summary
+
+    if not summary:
+        return fallback.label, fallback.summary
+
+    return label, summary
+
+
+def clean_label(label: str, fallback: str) -> str:
+    allowed = {
+        "Jarvis",
+        "Actuate",
+        "Shwaz",
+        "School",
+        "Admin",
+        "Coding",
+        "Browsing",
+        "Mixed/context switching",
+        "Unknown",
+    }
+    normalized = label.strip()
+    return normalized if normalized in allowed else fallback
+
+
+def complete_ollama_chat(prompt: str, config: OllamaConfig) -> str:
+    payload = {
+        "model": config.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "think": False,
+        "keep_alive": "30m",
+        "options": {"temperature": 0},
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = Request(
+        config.chat_url,
+        data=body,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=config.timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise OllamaChatError(f"ollama returned HTTP {error.code}: {detail}") from error
+    except URLError as error:
+        raise OllamaChatError(f"could not reach ollama: {error.reason}") from error
+    except (KeyError, json.JSONDecodeError) as error:
+        raise OllamaChatError(f"invalid ollama response: {error}") from error
+    except TimeoutError as error:
+        raise OllamaChatError("timed out connecting to ollama") from error
+
+    try:
+        return payload["message"]["content"]
+    except KeyError as error:
+        raise OllamaChatError(f"invalid ollama response: {error}") from error
 
 
 def build_ask_prompt(
@@ -340,6 +483,35 @@ def iter_ollama_content(response):
             yield content
 
 
+
+def start_summary_worker(
+    state: State,
+    ollama: OllamaConfig,
+    config: SummaryConfig,
+) -> threading.Thread | None:
+    if config.interval_seconds <= 0:
+        return None
+
+    def run() -> None:
+        pause = threading.Event()
+        while True:
+            pause.wait(config.interval_seconds)
+            try:
+                updated = state.refresh_summaries(
+                    ollama,
+                    config.lookback_minutes,
+                    config.stable_after_minutes,
+                )
+                if updated:
+                    print(f"summary worker updated {updated} sessions", flush=True)
+            except Exception as error:
+                print(f"summary worker error: {error}", flush=True)
+
+    thread = threading.Thread(target=run, name="jarvis-summary-worker", daemon=True)
+    thread.start()
+    return thread
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jarvis-mini",
@@ -367,6 +539,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=30.0,
         help="Ollama connection timeout in seconds. Default: 30.0.",
     )
+    parser.add_argument(
+        "--summary-interval",
+        type=float,
+        default=300.0,
+        help="Background summary interval in seconds. Use 0 to disable. Default: 300.",
+    )
+    parser.add_argument(
+        "--summary-lookback-minutes",
+        type=float,
+        default=24 * 60,
+        help="How far back the summary worker refreshes. Default: 1440.",
+    )
+    parser.add_argument(
+        "--summary-stable-after-minutes",
+        type=float,
+        default=5.0,
+        help="Do not summarize sessions that ended more recently than this. Default: 5.",
+    )
     return parser
 
 
@@ -374,12 +564,24 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     state = State(args.event_log, args.db_path)
     ollama = OllamaConfig(args.ollama_url, args.ollama_model, args.ollama_timeout)
+    summary_config = SummaryConfig(
+        interval_seconds=args.summary_interval,
+        lookback_minutes=args.summary_lookback_minutes,
+        stable_after_minutes=args.summary_stable_after_minutes,
+    )
+    start_summary_worker(state, ollama, summary_config)
     server = ThreadingHTTPServer((args.host, args.port), build_handler(state, ollama))
 
     print(f"jarvis-mini listening on http://{args.host}:{args.port}", flush=True)
     print(f"writing window events to {state.event_log}", flush=True)
     print(f"writing memory database to {state.db_path}", flush=True)
     print(f"ollama chat model {ollama.model} via {ollama.chat_url}", flush=True)
+    print(
+        f"summary worker interval {summary_config.interval_seconds:g}s "
+        f"lookback {summary_config.lookback_minutes:g}m "
+        f"stable_after {summary_config.stable_after_minutes:g}m",
+        flush=True,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
