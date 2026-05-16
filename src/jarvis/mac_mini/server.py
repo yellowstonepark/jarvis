@@ -19,6 +19,7 @@ from jarvis.mac_mini.memory import (
     format_events_for_summary,
     format_session_context,
     replace_session_summary,
+    should_ignore_window_event,
 )
 
 
@@ -45,16 +46,25 @@ class SummaryConfig:
 
 
 class State:
-    def __init__(self, event_log: Path, db_path: Path) -> None:
+    def __init__(
+        self,
+        event_log: Path,
+        db_path: Path,
+        profile_path: Path = Path("~/.jarvis/profile.json"),
+    ) -> None:
         self._lock = threading.Lock()
         self._latest_window: WindowSnapshot | None = None
         self._event_log = event_log.expanduser()
         self._memory = MemoryStore(db_path)
+        self._profile_path = profile_path.expanduser()
         self._memory.ingest_jsonl(self._event_log)
         self._ask_active = threading.Event()
         self._summary_lock = threading.Lock()
 
     def set_latest_window(self, snapshot: WindowSnapshot) -> None:
+        if should_ignore_window_event(snapshot):
+            return
+
         with self._lock:
             self._latest_window = snapshot
             self._append_event(snapshot)
@@ -70,6 +80,32 @@ class State:
     @property
     def db_path(self) -> Path:
         return self._memory.path
+
+    @property
+    def profile_path(self) -> Path:
+        return self._profile_path
+
+    def user_profile_context(self) -> str:
+        return format_user_profile(self._profile_path)
+
+    def recent_ask_context(self) -> str:
+        with self._lock:
+            interactions = self._memory.recent_ask_interactions(limit=5)
+        return format_ask_interactions(interactions)
+
+    def record_ask_interaction(
+        self,
+        prompt: str,
+        timezone_name: str | None,
+        location: str | None,
+    ) -> None:
+        with self._lock:
+            self._memory.record_ask_interaction(prompt, timezone_name, location, keep_latest=5)
+
+    def oldest_memory_context(self) -> str:
+        with self._lock:
+            oldest = self._memory.oldest_window_event()
+        return format_oldest_memory(oldest)
 
     def recent_window_events(
         self,
@@ -252,6 +288,11 @@ def build_handler(state: State, ollama: OllamaConfig):
                     session_context, relevant_session_context = state.ask_memory_context(
                         prompt, history_minutes
                     )
+                    recent_ask_context = state.recent_ask_context()
+                    user_profile_context = state.user_profile_context()
+                    window_stats_context = format_window_stats(events, history_minutes)
+                    oldest_memory_context = state.oldest_memory_context()
+                    state.record_ask_interaction(prompt, timezone_name, location)
                     prompt = build_ask_prompt(
                         prompt,
                         events,
@@ -259,9 +300,16 @@ def build_handler(state: State, ollama: OllamaConfig):
                         max_history_events,
                         session_context,
                         relevant_session_context,
+                        recent_ask_context=recent_ask_context,
+                        user_profile_context=user_profile_context,
+                        window_stats_context=window_stats_context,
+                        oldest_memory_context=oldest_memory_context,
                         timezone_name=timezone_name,
                         location=location,
                     )
+
+                if not with_window_history:
+                    state.record_ask_interaction(prompt, timezone_name, location)
 
                 try:
                     ollama_response = open_ollama_chat(prompt, ollama)
@@ -457,6 +505,86 @@ def complete_ollama_chat(prompt: str, config: OllamaConfig) -> str:
     except KeyError as error:
         raise OllamaChatError(f"invalid ollama response: {error}") from error
 
+def format_user_profile(profile_path: Path) -> str:
+    if not profile_path.exists():
+        return ""
+    try:
+        data = json.loads(profile_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "- User profile exists but could not be read as JSON."
+    if not isinstance(data, dict) or not data:
+        return ""
+
+    lines = []
+    for key in sorted(data):
+        value = data[key]
+        if isinstance(value, (dict, list)):
+            rendered = json.dumps(value, separators=(",", ":"))
+        else:
+            rendered = str(value)
+        lines.append(f"- {key}: {rendered}")
+    return "\n".join(lines)
+
+
+def format_ask_interactions(interactions: list[dict[str, str | None]]) -> str:
+    if not interactions:
+        return ""
+    lines = []
+    for item in interactions:
+        asked_at = parse_timestamp(str(item["asked_at"])).strftime("%H:%M")
+        lines.append(f"- {asked_at} {item['prompt']}")
+    return "\n".join(lines)
+
+
+def format_oldest_memory(snapshot: WindowSnapshot | None) -> str:
+    if snapshot is None:
+        return ""
+    observed_at = parse_timestamp(snapshot.observed_at).isoformat()
+    title = f" - {snapshot.window_title}" if snapshot.window_title else ""
+    return f"- Oldest recorded window event: {observed_at} {snapshot.app_name}{title}"
+
+
+def format_window_stats(events: list[WindowSnapshot], history_minutes: float) -> str:
+    if not events:
+        return ""
+
+    sorted_events = sorted(events, key=lambda event: parse_timestamp(event.observed_at))
+    segments: list[tuple[datetime, datetime, WindowSnapshot]] = []
+    for event in sorted_events:
+        observed_at = parse_timestamp(event.observed_at)
+        if not segments:
+            segments.append((observed_at, observed_at, event))
+            continue
+        start, _, previous = segments[-1]
+        if (previous.app_name, previous.window_title) == (event.app_name, event.window_title):
+            segments[-1] = (start, observed_at, previous)
+        else:
+            segments.append((observed_at, observed_at, event))
+
+    switches = max(0, len(segments) - 1)
+    observed_minutes = max(
+        (parse_timestamp(sorted_events[-1].observed_at) - parse_timestamp(sorted_events[0].observed_at)).total_seconds() / 60,
+        min(history_minutes, 1),
+    )
+    switches_per_minute = switches / observed_minutes if observed_minutes else 0
+    unique_apps = sorted({event.app_name for event in sorted_events})
+    longest = max((end - start for start, end, _ in segments), default=timedelta(0))
+    longest_minutes = longest.total_seconds() / 60
+
+    if switches_per_minute >= 1.5:
+        switching_level = "high"
+    elif switches_per_minute >= 0.5:
+        switching_level = "moderate"
+    else:
+        switching_level = "low"
+
+    return (
+        f"- Switches: {switches}\n"
+        f"- Switches per minute: {switches_per_minute:.2f}\n"
+        f"- Switching level: {switching_level}\n"
+        f"- Unique apps: {len(unique_apps)} ({', '.join(unique_apps[:8])})\n"
+        f"- Longest continuous same-window stretch: {longest_minutes:.1f} minutes"
+    )
 
 def build_ask_prompt(
     question: str,
@@ -465,6 +593,10 @@ def build_ask_prompt(
     max_segments: int = 80,
     session_context: str = "",
     relevant_session_context: str = "",
+    recent_ask_context: str = "",
+    user_profile_context: str = "",
+    window_stats_context: str = "",
+    oldest_memory_context: str = "",
     timezone_name: str | None = None,
     location: str | None = None,
 ) -> str:
@@ -478,6 +610,18 @@ def build_ask_prompt(
     if not relevant_session_context:
         relevant_session_context = "- No older matching session memories were found."
 
+    if not recent_ask_context:
+        recent_ask_context = "- No previous Jarvis ask commands are available."
+
+    if not user_profile_context:
+        user_profile_context = "- No user profile is configured."
+
+    if not window_stats_context:
+        window_stats_context = "- No window switching stats are available."
+
+    if not oldest_memory_context:
+        oldest_memory_context = "- No oldest memory marker is available."
+
     context = build_environment_context(timezone_name, location)
 
     return (
@@ -485,9 +629,14 @@ def build_ask_prompt(
         "the session memories and recent window timeline below when the question "
         "asks about activity, focus, apps, projects, or recent work. Prefer "
         "relevant older session memories when the question names a topic from the past, "
-        "recent session summaries for current context, and raw events for details. "
+        "recent session summaries for current context, recent Jarvis ask commands for "
+        "follow-up questions, window stats for focus/switching questions, and raw events for details. "
         "If the context is insufficient, say what is missing. Do not invent details.\n\n"
         f"Current context:\n{context}\n\n"
+        f"User profile:\n{user_profile_context}\n\n"
+        f"Previous Jarvis ask commands:\n{recent_ask_context}\n\n"
+        f"Oldest memory marker:\n{oldest_memory_context}\n\n"
+        f"Window switching stats, last {history_minutes:g} minutes:\n{window_stats_context}\n\n"
         f"User question:\n{question.strip()}\n\n"
         f"Recent session summaries, last {history_minutes:g} minutes:\n{session_context}\n\n"
         f"Relevant older session memories:\n{relevant_session_context}\n\n"
@@ -653,6 +802,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("~/.jarvis/jarvis.sqlite"),
         help="Path for SQLite memory store. Default: ~/.jarvis/jarvis.sqlite.",
     )
+    parser.add_argument(
+        "--profile-path",
+        type=Path,
+        default=Path("~/.jarvis/profile.json"),
+        help="Path for user profile JSON. Default: ~/.jarvis/profile.json.",
+    )
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--ollama-model", default="gemma4.e4b")
     parser.add_argument(
@@ -684,7 +839,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    state = State(args.event_log, args.db_path)
+    state = State(args.event_log, args.db_path, args.profile_path)
     ollama = OllamaConfig(args.ollama_url, args.ollama_model, args.ollama_timeout)
     summary_config = SummaryConfig(
         interval_seconds=args.summary_interval,
@@ -697,6 +852,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"jarvis-mini listening on http://{args.host}:{args.port}", flush=True)
     print(f"writing window events to {state.event_log}", flush=True)
     print(f"writing memory database to {state.db_path}", flush=True)
+    print(f"reading user profile from {state.profile_path}", flush=True)
     print(f"ollama chat model {ollama.model} via {ollama.chat_url}", flush=True)
     print(
         f"summary worker interval {summary_config.interval_seconds:g}s "

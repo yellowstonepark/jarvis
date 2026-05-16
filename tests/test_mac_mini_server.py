@@ -6,7 +6,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from jarvis.common.models import WindowSnapshot
-from jarvis.mac_mini.server import OllamaConfig, State, build_ask_prompt, format_window_timeline, open_ollama_chat, parse_session_summary_response
+from jarvis.mac_mini.server import (
+    OllamaConfig,
+    State,
+    build_ask_prompt,
+    format_user_profile,
+    format_window_stats,
+    format_window_timeline,
+    open_ollama_chat,
+    parse_session_summary_response,
+)
 from jarvis.mac_mini.memory import ActivitySession, MemoryStore, format_session_context, render_sessions
 
 
@@ -62,6 +71,46 @@ class StateTests(unittest.TestCase):
             self.assertIn("SQLite memory.py", recent_context)
             self.assertIn("Older Jarvis SQLite memory", relevant_context)
             self.assertNotIn("SQLite memory.py", relevant_context)
+
+
+    def test_set_latest_window_ignores_terminal_jarvis_ask_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            event_log = Path(tmpdir) / ".jarvis" / "window-events.jsonl"
+            db_path = Path(tmpdir) / ".jarvis" / "jarvis.sqlite"
+            state = State(event_log, db_path)
+
+            state.set_latest_window(
+                WindowSnapshot(
+                    "Terminal",
+                    "jarvis ask what was I doing",
+                    "2026-05-16T12:00:00+00:00",
+                    "macbook",
+                )
+            )
+
+            self.assertIsNone(state.get_latest_window())
+            self.assertFalse(event_log.exists())
+            self.assertEqual(state.recent_window_events(60), [])
+
+    def test_record_ask_interaction_keeps_latest_five(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            event_log = Path(tmpdir) / ".jarvis" / "window-events.jsonl"
+            db_path = Path(tmpdir) / ".jarvis" / "jarvis.sqlite"
+            state = State(event_log, db_path)
+
+            for index in range(7):
+                state.record_ask_interaction(
+                    f"question {index}",
+                    "America/Los_Angeles",
+                    None,
+                )
+
+            context = state.recent_ask_context()
+
+            self.assertNotIn("question 0", context)
+            self.assertNotIn("question 1", context)
+            self.assertIn("question 2", context)
+            self.assertIn("question 6", context)
 
 
 class MemoryStoreTests(unittest.TestCase):
@@ -229,6 +278,50 @@ class TimelinePromptTests(unittest.TestCase):
 
         self.assertIn("Relevant older session memories", prompt)
         self.assertIn("No older matching session memories were found", prompt)
+
+
+    def test_build_ask_prompt_includes_profile_previous_asks_stats_and_oldest_marker(self) -> None:
+        prompt = build_ask_prompt(
+            "but was that a lot?",
+            [],
+            20,
+            recent_ask_context="- 12:00 did I switch windows a lot?",
+            user_profile_context="- name: Otzar",
+            window_stats_context="- Switches: 12\n- Switching level: moderate",
+            oldest_memory_context="- Oldest recorded window event: 2026-05-16T12:00:00+00:00 ChatGPT",
+        )
+
+        self.assertIn("User profile:\n- name: Otzar", prompt)
+        self.assertIn("Previous Jarvis ask commands", prompt)
+        self.assertIn("did I switch windows a lot?", prompt)
+        self.assertIn("Switching level: moderate", prompt)
+        self.assertIn("Oldest recorded window event", prompt)
+
+    def test_format_window_stats_reports_switch_rate(self) -> None:
+        events = [
+            WindowSnapshot("Terminal", "jarvis", "2026-05-16T18:00:00+00:00", "macbook"),
+            WindowSnapshot("Code", "server.py", "2026-05-16T18:01:00+00:00", "macbook"),
+            WindowSnapshot("Safari", "Docs", "2026-05-16T18:02:00+00:00", "macbook"),
+        ]
+
+        stats = format_window_stats(events, 20)
+
+        self.assertIn("Switches: 2", stats)
+        self.assertIn("Switches per minute: 1.00", stats)
+        self.assertIn("Unique apps: 3", stats)
+
+    def test_format_user_profile_reads_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_path = Path(tmpdir) / "profile.json"
+            profile_path.write_text(
+                json.dumps({"name": "Otzar", "projects": ["Jarvis"]}),
+                encoding="utf-8",
+            )
+
+            profile = format_user_profile(profile_path)
+
+            self.assertIn("- name: Otzar", profile)
+            self.assertIn('- projects: ["Jarvis"]', profile)
 
 
 class SmartSummaryTests(unittest.TestCase):

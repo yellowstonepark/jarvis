@@ -26,6 +26,13 @@ class ActivitySession:
     updated_at: str = ""
 
 
+def should_ignore_window_event(snapshot: WindowSnapshot) -> bool:
+    app_name = snapshot.app_name.lower()
+    title = (snapshot.window_title or "").lower()
+    terminal_apps = {"terminal", "iterm2", "warp"}
+    return app_name in terminal_apps and "jarvis ask" in title
+
+
 def parse_timestamp(value: str) -> datetime:
     normalized = value.replace("Z", "+00:00")
     parsed = datetime.fromisoformat(normalized)
@@ -103,6 +110,23 @@ class MemoryStore:
             ensure_column(connection, "sessions", "evidence_windows", "TEXT NOT NULL DEFAULT '[]'")
             ensure_column(connection, "sessions", "updated_at", "TEXT NOT NULL DEFAULT ''")
             self._initialize_session_fts(connection)
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ask_interactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    asked_at TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    timezone TEXT,
+                    location TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ask_interactions_asked_at
+                ON ask_interactions(asked_at)
+                """
+            )
 
     def _initialize_session_fts(self, connection: sqlite3.Connection) -> None:
         try:
@@ -162,6 +186,9 @@ class MemoryStore:
         return inserted
 
     def insert_window_event(self, snapshot: WindowSnapshot) -> int:
+        if should_ignore_window_event(snapshot):
+            return 0
+
         raw_json = snapshot.to_json()
         with self._connect() as connection:
             cursor = connection.execute(
@@ -179,6 +206,75 @@ class MemoryStore:
                 ),
             )
             return cursor.rowcount
+
+    def record_ask_interaction(
+        self,
+        prompt: str,
+        timezone_name: str | None = None,
+        location: str | None = None,
+        keep_latest: int = 5,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ask_interactions (asked_at, prompt, timezone, location)
+                VALUES (?, ?, ?, ?)
+                """,
+                (utc_now().isoformat(), prompt.strip(), timezone_name, location),
+            )
+            connection.execute(
+                """
+                DELETE FROM ask_interactions
+                WHERE id NOT IN (
+                    SELECT id FROM ask_interactions
+                    ORDER BY asked_at DESC, id DESC
+                    LIMIT ?
+                )
+                """,
+                (keep_latest,),
+            )
+
+    def recent_ask_interactions(self, limit: int = 5) -> list[dict[str, str | None]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT asked_at, prompt, timezone, location
+                FROM ask_interactions
+                ORDER BY asked_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        return [
+            {
+                "asked_at": row["asked_at"],
+                "prompt": row["prompt"],
+                "timezone": row["timezone"],
+                "location": row["location"],
+            }
+            for row in reversed(rows)
+        ]
+
+    def oldest_window_event(self) -> WindowSnapshot | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT app_name, window_title, observed_at, source
+                FROM window_events
+                ORDER BY observed_at ASC
+                LIMIT 1
+                """
+            ).fetchone()
+
+        if row is None:
+            return None
+        return WindowSnapshot(
+            app_name=row["app_name"],
+            window_title=row["window_title"],
+            observed_at=row["observed_at"],
+            source=row["source"],
+        )
 
     def window_events_between(
         self,
