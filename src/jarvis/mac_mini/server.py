@@ -10,6 +10,7 @@ from pathlib import Path
 import threading
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from jarvis.common.models import WindowSnapshot
 from jarvis.mac_mini.memory import (
@@ -205,6 +206,8 @@ def build_handler(state: State, ollama: OllamaConfig):
                 with_window_history = payload.get("with_window_history", True)
                 history_minutes = float(payload.get("history_minutes", 30))
                 max_history_events = int(payload.get("max_history_events", 80))
+                timezone_name = payload.get("timezone")
+                location = payload.get("location")
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 self.write_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid ask payload: {error}"})
                 return
@@ -225,6 +228,14 @@ def build_handler(state: State, ollama: OllamaConfig):
                 self.write_json(HTTPStatus.BAD_REQUEST, {"error": "max_history_events must be greater than 0"})
                 return
 
+            if timezone_name is not None and not isinstance(timezone_name, str):
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "timezone must be a string"})
+                return
+
+            if location is not None and not isinstance(location, str):
+                self.write_json(HTTPStatus.BAD_REQUEST, {"error": "location must be a string"})
+                return
+
             state.begin_interactive_request()
             try:
                 if with_window_history:
@@ -236,6 +247,8 @@ def build_handler(state: State, ollama: OllamaConfig):
                         history_minutes,
                         max_history_events,
                         session_context,
+                        timezone_name=timezone_name,
+                        location=location,
                     )
 
                 try:
@@ -380,6 +393,8 @@ def build_ask_prompt(
     history_minutes: float,
     max_segments: int = 80,
     session_context: str = "",
+    timezone_name: str | None = None,
+    location: str | None = None,
 ) -> str:
     timeline = format_window_timeline(events, max_segments)
     if not timeline:
@@ -388,16 +403,46 @@ def build_ask_prompt(
     if not session_context:
         session_context = "- No session summaries are available yet."
 
+    context = build_environment_context(timezone_name, location)
+
     return (
         "You are Jarvis, a concise local assistant. Answer the user using only "
         "the session summaries and recent window timeline below when the question "
         "asks about activity, focus, apps, projects, or recent work. Prefer "
         "session summaries for higher-level answers and raw events for details. "
         "If the context is insufficient, say what is missing. Do not invent details.\n\n"
+        f"Current context:\n{context}\n\n"
         f"User question:\n{question.strip()}\n\n"
         f"Recent session summaries, last {history_minutes:g} minutes:\n{session_context}\n\n"
         f"Recent raw window timeline, last {history_minutes:g} minutes:\n{timeline}\n\n"
         "Answer concisely."
+    )
+
+
+
+def build_environment_context(
+    timezone_name: str | None,
+    location: str | None,
+) -> str:
+    now_utc = datetime.now(timezone.utc)
+    tz = timezone.utc
+    timezone_label = "UTC"
+
+    if timezone_name:
+        try:
+            tz = ZoneInfo(timezone_name)
+            timezone_label = timezone_name
+        except ZoneInfoNotFoundError:
+            timezone_label = timezone_name
+
+    now_local = now_utc.astimezone(tz)
+    location_label = location.strip() if location and location.strip() else "unknown"
+
+    return (
+        f"- Current UTC time: {now_utc.isoformat()}\n"
+        f"- Current local time: {now_local.isoformat()}\n"
+        f"- Timezone: {timezone_label}\n"
+        f"- Location: {location_label}"
     )
 
 

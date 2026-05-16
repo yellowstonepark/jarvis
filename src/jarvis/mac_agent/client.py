@@ -5,6 +5,7 @@ import codecs
 import json
 import os
 from pathlib import Path
+from datetime import datetime
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -139,6 +140,15 @@ def default_receiver_endpoint() -> str | None:
     return ask_endpoint_from_receiver_url(receiver_url)
 
 
+def local_timezone_name() -> str:
+    local_tz = datetime.now().astimezone().tzinfo
+    key = getattr(local_tz, "key", None)
+    if key:
+        return key
+    name = datetime.now().astimezone().tzname()
+    return name or "UTC"
+
+
 def ask_endpoint_from_receiver_url(receiver_url: str) -> str:
     if receiver_url.endswith("/v1/window/events"):
         return receiver_url[: -len("/v1/window/events")] + "/v1/ask"
@@ -157,7 +167,7 @@ class AskClient:
         with_window_history: bool = True,
         history_minutes: float = 30,
         max_history_events: int = 80,
-        smart_summaries: bool = True,
+        timezone_name: str | None = None,
     ) -> None:
         body = json.dumps(
             {
@@ -165,7 +175,7 @@ class AskClient:
                 "with_window_history": with_window_history,
                 "history_minutes": history_minutes,
                 "max_history_events": max_history_events,
-                "smart_summaries": smart_summaries,
+                "timezone": timezone_name or local_timezone_name(),
             },
             separators=(",", ":"),
         ).encode("utf-8")

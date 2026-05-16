@@ -52,12 +52,13 @@ jarvis ask --history-minutes 60 "summarize my last hour"
 jarvis ask --no-window-history "what is the fastest way to test this?"
 ```
 
-The Mac mini runs a background summary worker that periodically compresses stable window sessions with Ollama and caches them in SQLite. `jarvis ask` uses those cached summaries plus recent raw window events, so the interactive path stays fast:
+The Mac mini runs a background summary worker that periodically compresses stable window sessions with Ollama and caches them in SQLite. `jarvis ask` uses those cached summaries plus recent raw window events, and includes current UTC/local time plus the MacBook timezone, so the interactive path stays fast and relative-time questions work:
 
 ```sh
 jarvis ask "what did I work on recently?"
 jarvis ask "summarize my last two hours"
 jarvis ask "was I focused or bouncing around?"
+jarvis ask "what time is it right now?"
 ```
 
 Use plain chatbot mode when you do not want Jarvis to include window memory:

@@ -70,8 +70,17 @@ class TimelinePromptTests(unittest.TestCase):
             WindowSnapshot("Safari", "Ollama docs", "2026-05-16T18:00:00+00:00", "macbook"),
         ]
 
-        prompt = build_ask_prompt("what was I doing?", events, 30)
+        prompt = build_ask_prompt(
+            "what was I doing?",
+            events,
+            30,
+            timezone_name="America/Los_Angeles",
+            location="unknown",
+        )
 
+        self.assertIn("Current context:", prompt)
+        self.assertIn("Timezone: America/Los_Angeles", prompt)
+        self.assertIn("Location: unknown", prompt)
         self.assertIn("User question:\nwhat was I doing?", prompt)
         self.assertIn("Recent raw window timeline, last 30 minutes", prompt)
         self.assertIn("Safari - Ollama docs", prompt)

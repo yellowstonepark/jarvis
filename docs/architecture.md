@@ -36,7 +36,7 @@ It currently exposes:
 - `GET /v1/window/latest`
 - `POST /v1/ask`
 
-`POST /v1/ask` proxies a prompt to local Ollama via `/api/chat` and streams plain text back to the caller. By default it reads recent SQLite-backed session summaries plus recent raw window events, then injects both into the prompt. The default Ollama request uses `model: gemma4.e4b`, `think: false`, `stream: true`, and `temperature: 0`.
+`POST /v1/ask` proxies a prompt to local Ollama via `/api/chat` and streams plain text back to the caller. By default it reads recent SQLite-backed session summaries plus recent raw window events, then injects both into the prompt along with current UTC time, current local time, timezone, and optional location. The default Ollama request uses `model: gemma4.e4b`, `think: false`, `stream: true`, and `temperature: 0`.
 
 The Mac mini keeps JSONL as an append-only backup and stores queryable memory in SQLite at `~/.jarvis/jarvis.sqlite` by default. Current tables:
 
@@ -143,3 +143,7 @@ local sensing and strictly allowlisted actions.
 
 Later, this can move from a development wrapper to a fully standalone signed
 bundle with a stable Developer ID signature.
+
+## Time And Location Context
+
+`jarvis ask` sends the MacBook timezone with each request. The Mac mini expands that into explicit current UTC and local timestamps before prompting Ollama, so questions like "what time is it" and "what happened ten minutes ago" have a concrete reference point. Fine-grained physical location, such as a campus building, is not inferred yet; the prompt currently marks location as unknown unless a future client supplies it.

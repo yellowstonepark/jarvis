@@ -105,6 +105,7 @@ class AskClientTests(unittest.TestCase):
             with_window_history=True,
             history_minutes=45,
             max_history_events=120,
+            timezone_name="America/Los_Angeles",
         )
 
         request = mock_urlopen.call_args.args[0]
@@ -114,6 +115,7 @@ class AskClientTests(unittest.TestCase):
         self.assertIs(payload["with_window_history"], True)
         self.assertEqual(payload["history_minutes"], 45)
         self.assertEqual(payload["max_history_events"], 120)
+        self.assertEqual(payload["timezone"], "America/Los_Angeles")
         self.assertEqual("".join(chunks), "ok")
 
 
