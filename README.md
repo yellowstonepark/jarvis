@@ -133,6 +133,35 @@ If the Mac mini is unreachable, the MacBook CLI/app queues unsent events here an
 ~/.jarvis/window-outbox.jsonl
 ```
 
+
+Build the push-to-talk macOS hotkey app:
+
+```sh
+PYTHONPATH=src .venv/bin/python scripts/build_hotkey_app.py
+open dist/JarvisHotkey.app
+```
+
+`JarvisHotkey.app` is a separate accessory app. Hold `Caps Lock` to record, release to stop, then it transcribes with Apple Speech, sends the transcript to the Mac mini `/v1/ask`, and posts the finished answer as a macOS notification. It reads the same `~/.jarvis/receiver-url` file as the main app/CLI.
+
+Permissions needed on first run:
+
+- Input Monitoring for the global shortcut event tap.
+- Microphone for recording.
+- Speech Recognition for Apple Speech transcription.
+- Notifications for the final answer.
+
+Hotkey logs are written to:
+
+```sh
+~/Library/Logs/Jarvis/jarvis-hotkey.log
+```
+
+Stop the hotkey app:
+
+```sh
+killall JarvisHotkey
+```
+
 Build the dedicated macOS app:
 
 ```sh
@@ -172,3 +201,4 @@ Run tests:
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
+# watchman-agentic
