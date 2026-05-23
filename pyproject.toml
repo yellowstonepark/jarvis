@@ -8,9 +8,8 @@ license = { file = "LICENSE" }
 
 dependencies = [
     "mlx-audio>=0.2.9",
-    "mistral-common[audio]>=1.10.0",
+    "misaki[en]>=0.9.4",
     "numpy",
-    "scipy",
     "soundfile",
 ]
 

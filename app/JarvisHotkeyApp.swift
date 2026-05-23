@@ -17,8 +17,11 @@ let configDirectory = FileManager.default.homeDirectoryForCurrentUser
 let receiverURLFile = configDirectory.appendingPathComponent("receiver-url")
 let ttsURLFile = configDirectory.appendingPathComponent("tts-url")
 let ttsVoiceFile = configDirectory.appendingPathComponent("tts-voice")
-let defaultTTSURL = "http://127.0.0.1:28766/v1/speak/stream"
-let defaultTTSVoice = "neutral_male"
+let ttsVolumeFile = configDirectory.appendingPathComponent("tts-volume")
+let defaultTTSURL = "http://127.0.0.1:28766/v1/speak"
+let defaultTTSVoice = "am_adam"
+// afplay volume 0–255; ~52 ≈ 20% system-scale playback.
+let defaultAfplayVolume = 52
 
 final class HotkeyAppDelegate: NSObject, NSApplicationDelegate {
     private var eventTap: CFMachPort?
@@ -424,6 +427,15 @@ final class AfplaySpeechPlayer {
 
         let wav = wrapPCMInWAV(pcmData)
         pcmData = Data()
+        playWavData(wav)
+    }
+
+    func playWavData(_ wav: Data) {
+        guard wav.isEmpty == false else {
+            log("tts_empty_audio")
+            reset()
+            return
+        }
 
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("jarvis-tts-\(UUID().uuidString).wav")
@@ -457,7 +469,7 @@ final class AfplaySpeechPlayer {
         stopPlayback()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
-        process.arguments = [url.path]
+        process.arguments = ["-v", String(configuredAfplayVolume()), url.path]
         process.terminationHandler = { _ in
             DispatchQueue.main.async {
                 AfplaySpeechPlayer.shared.playbackDidFinish()
@@ -502,7 +514,7 @@ private var ttsStreamSession: URLSession?
 private var ttsStreamDelegate: TTSStreamSessionDelegate?
 
 func speakAnswer(_ text: String) {
-    guard let speakURL = configuredTTSStreamURL() else {
+    guard let speakURL = configuredTTSURL() else {
         log("tts_skipped_no_url")
         return
     }
@@ -514,21 +526,58 @@ func speakAnswer(_ text: String) {
 
     do {
         AfplaySpeechPlayer.shared.begin()
-        let delegate = TTSStreamSessionDelegate()
-        ttsStreamDelegate = delegate
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 120
-        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
-        ttsStreamSession = session
-
         var request = URLRequest(url: speakURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        session.dataTask(with: request).resume()
+
+        if speakURL.path.hasSuffix("/speak/stream") {
+            let delegate = TTSStreamSessionDelegate()
+            ttsStreamDelegate = delegate
+            let configuration = URLSessionConfiguration.default
+            configuration.timeoutIntervalForRequest = 120
+            let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+            ttsStreamSession = session
+            session.dataTask(with: request).resume()
+            return
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            DispatchQueue.main.async {
+                if let error {
+                    log("tts_request_error \(error)")
+                    AfplaySpeechPlayer.shared.reset()
+                    return
+                }
+                guard let data, data.isEmpty == false else {
+                    log("tts_empty_audio")
+                    AfplaySpeechPlayer.shared.reset()
+                    return
+                }
+                if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                    log("tts_http_error status=\(http.statusCode)")
+                    AfplaySpeechPlayer.shared.reset()
+                    return
+                }
+                AfplaySpeechPlayer.shared.playWavData(data)
+            }
+        }.resume()
     } catch {
         log("tts_request_error \(error)")
     }
+}
+
+func configuredAfplayVolume() -> Int {
+    if let rawValue = try? String(contentsOf: ttsVolumeFile, encoding: .utf8) {
+        let trimmedValue = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let parsed = Int(trimmedValue) {
+            return min(255, max(0, parsed))
+        }
+        if let fraction = Double(trimmedValue), fraction >= 0, fraction <= 1 {
+            return Int((fraction * 255).rounded())
+        }
+    }
+    return defaultAfplayVolume
 }
 
 func configuredTTSVoice() -> String {

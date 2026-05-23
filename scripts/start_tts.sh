@@ -15,17 +15,19 @@ fi
 
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
-VOICE="${JARVIS_TTS_VOICE:-neutral_male}"
-SEED="${JARVIS_TTS_SEED:-42}"
+MODEL="${JARVIS_TTS_MODEL:-mlx-community/Kokoro-82M-bf16}"
+VOICE="${JARVIS_TTS_VOICE:-am_adam}"
+LANG="${JARVIS_TTS_LANG:-a}"
+SPEED="${JARVIS_TTS_SPEED:-1.0}"
 GAIN="${JARVIS_TTS_GAIN:-1.0}"
-MODEL="${JARVIS_TTS_MODEL:-mlx-community/Voxtral-4B-TTS-2603-mlx-4bit}"
 
 exec "$PYTHON" -m jarvis.tts_server \
   --host 127.0.0.1 \
   --port 28766 \
   --model "$MODEL" \
   --voice "$VOICE" \
-  --seed "$SEED" \
+  --lang-code "$LANG" \
+  --speed "$SPEED" \
   --gain "$GAIN" \
   --preload \
   "$@"
