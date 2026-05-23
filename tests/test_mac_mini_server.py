@@ -192,6 +192,27 @@ class MemoryStoreTests(unittest.TestCase):
 
             self.assertEqual(store.search_sessions("what was I doing?"), [])
 
+    def test_ingest_jsonl_skips_when_checkpoint_is_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "window-events.jsonl"
+            log_path.write_text(
+                WindowSnapshot("Terminal", "jarvis", "2026-05-16T18:00:00+00:00", "macbook").to_json()
+                + "\n",
+                encoding="utf-8",
+            )
+            store = MemoryStore(Path(tmpdir) / "jarvis.sqlite")
+
+            self.assertEqual(store.ingest_jsonl(log_path), 1)
+            self.assertEqual(store.ingest_jsonl(log_path), 0)
+
+            with log_path.open("a", encoding="utf-8") as file:
+                file.write(
+                    WindowSnapshot("Code", "server.py", "2026-05-16T18:01:00+00:00", "macbook").to_json()
+                    + "\n"
+                )
+
+            self.assertEqual(store.ingest_jsonl(log_path), 1)
+
 
 class TimelinePromptTests(unittest.TestCase):
     def test_format_window_timeline_compacts_repeated_windows(self) -> None:

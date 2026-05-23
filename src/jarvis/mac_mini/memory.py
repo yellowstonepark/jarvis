@@ -9,6 +9,8 @@ import sqlite3
 
 from jarvis.common.models import WindowSnapshot
 
+INGEST_BATCH_SIZE = 512
+
 
 @dataclass(frozen=True)
 class ActivitySession:
@@ -128,6 +130,16 @@ class MemoryStore:
                 ON ask_interactions(asked_at)
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ingest_checkpoints (
+                    path TEXT PRIMARY KEY,
+                    file_size INTEGER NOT NULL,
+                    byte_offset INTEGER NOT NULL,
+                    ingested_at TEXT NOT NULL
+                )
+                """
+            )
 
     def _initialize_session_fts(self, connection: sqlite3.Connection) -> None:
         try:
@@ -169,44 +181,112 @@ class MemoryStore:
             insert_session_fts_row(connection, row)
 
     def ingest_jsonl(self, path: Path) -> int:
-        expanded_path = path.expanduser()
+        """Import window events from JSONL, resuming from the last checkpoint."""
+        expanded_path = path.expanduser().resolve()
         if not expanded_path.exists():
             return 0
 
+        file_size = expanded_path.stat().st_size
+        checkpoint_key = str(expanded_path)
+        start_offset = 0
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT file_size, byte_offset
+                FROM ingest_checkpoints
+                WHERE path = ?
+                """,
+                (checkpoint_key,),
+            ).fetchone()
+            if row:
+                start_offset = int(row["byte_offset"])
+                if start_offset > file_size:
+                    start_offset = 0
+                elif int(row["file_size"]) == file_size and start_offset >= file_size:
+                    return 0
+
         inserted = 0
-        with expanded_path.open(encoding="utf-8") as file:
-            for line in file:
-                line = line.strip()
+        batch: list[WindowSnapshot] = []
+        end_offset = start_offset
+
+        with expanded_path.open("rb") as file:
+            if start_offset:
+                file.seek(start_offset)
+            while True:
+                line_bytes = file.readline()
+                if not line_bytes:
+                    break
+                end_offset = file.tell()
+                line = line_bytes.decode("utf-8").strip()
                 if not line:
                     continue
                 try:
                     snapshot = WindowSnapshot.from_json(line)
                 except (KeyError, TypeError, json.JSONDecodeError):
                     continue
-                inserted += self.insert_window_event(snapshot)
+                if should_ignore_window_event(snapshot):
+                    continue
+                batch.append(snapshot)
+                if len(batch) >= INGEST_BATCH_SIZE:
+                    inserted += self._insert_window_events_batch(batch)
+                    batch.clear()
+
+        if batch:
+            inserted += self._insert_window_events_batch(batch)
+        end_offset = file_size
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ingest_checkpoints (path, file_size, byte_offset, ingested_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    file_size = excluded.file_size,
+                    byte_offset = excluded.byte_offset,
+                    ingested_at = excluded.ingested_at
+                """,
+                (
+                    checkpoint_key,
+                    file_size,
+                    end_offset,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
         return inserted
 
-    def insert_window_event(self, snapshot: WindowSnapshot) -> int:
-        if should_ignore_window_event(snapshot):
+    def _insert_window_events_batch(self, snapshots: list[WindowSnapshot]) -> int:
+        if not snapshots:
             return 0
 
-        raw_json = snapshot.to_json()
+        rows = [
+            (
+                parse_timestamp(snapshot.observed_at).isoformat(),
+                snapshot.source,
+                snapshot.app_name,
+                snapshot.window_title,
+                snapshot.to_json(),
+            )
+            for snapshot in snapshots
+        ]
+
         with self._connect() as connection:
-            cursor = connection.execute(
+            before = connection.total_changes
+            connection.executemany(
                 """
                 INSERT OR IGNORE INTO window_events (
                     observed_at, source, app_name, window_title, raw_json
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (
-                    parse_timestamp(snapshot.observed_at).isoformat(),
-                    snapshot.source,
-                    snapshot.app_name,
-                    snapshot.window_title,
-                    raw_json,
-                ),
+                rows,
             )
-            return cursor.rowcount
+            return connection.total_changes - before
+
+    def insert_window_event(self, snapshot: WindowSnapshot) -> int:
+        if should_ignore_window_event(snapshot):
+            return 0
+        return self._insert_window_events_batch([snapshot])
 
     def record_ask_interaction(
         self,

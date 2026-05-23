@@ -58,7 +58,14 @@ class State:
         self._event_log = event_log.expanduser()
         self._memory = MemoryStore(db_path)
         self._profile_path = profile_path.expanduser()
-        self._memory.ingest_jsonl(self._event_log)
+        inserted = self._memory.ingest_jsonl(self._event_log)
+        if inserted:
+            print(
+                f"ingested {inserted} new window events from {self._event_log}",
+                flush=True,
+            )
+        else:
+            print(f"window event log up to date ({self._event_log})", flush=True)
         self._ask_active = threading.Event()
         self._summary_lock = threading.Lock()
 
