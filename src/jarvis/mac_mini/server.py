@@ -774,7 +774,15 @@ def build_ask_prompt(
         "- Do not use symbols or abbreviations that sound awkward when spoken (say \"percent\" not \"%\").\n"
         "- No preamble (\"Sure\", \"Here's\", \"Based on\")—start with the answer.\n"
         "- For activity questions, use only the context below; if insufficient, say briefly what is missing.\n"
-        "- Do not invent details.\n\n"
+        "- Do not invent details.\n"
+        "- Time questions: answer with the clock only (e.g. \"It's nine fifteen AM\"). "
+        "Never mention UTC, ISO timestamps, timezones, or the phrase \"local time\".\n"
+        "- Current app or window: use present tense (e.g. \"You're in Cursor working on the start tts dot sh file\"). "
+        "Never say \"last seen\", \"were in\", or past tense for what is open now.\n"
+        "- Prior Jarvis asks: paraphrase in natural reported speech "
+        "(e.g. \"You asked what you were doing recently\"), not a verbatim quote.\n"
+        "- Filenames and paths: speak for TTS—underscores as spaces, extensions as words "
+        "(start_tts.sh → \"start tts dot sh\", server.py → \"server dot py\").\n\n"
         "Context usage:\n"
         "- Prefer relevant older session memories for past topics, recent summaries for now, "
         "recent Jarvis asks for follow-ups, window stats for focus questions, raw events for detail.\n\n"
@@ -792,30 +800,36 @@ def build_ask_prompt(
 
 
 
+def format_speakable_clock(moment: datetime) -> str:
+    hour = int(moment.strftime("%I"))
+    minute = moment.strftime("%M")
+    period = moment.strftime("%p")
+    return f"{hour}:{minute} {period}"
+
+
 def build_environment_context(
     timezone_name: str | None,
     location: str | None,
 ) -> str:
     now_utc = datetime.now(timezone.utc)
     tz = timezone.utc
-    timezone_label = "UTC"
 
     if timezone_name:
         try:
             tz = ZoneInfo(timezone_name)
-            timezone_label = timezone_name
         except ZoneInfoNotFoundError:
-            timezone_label = timezone_name
+            pass
 
     now_local = now_utc.astimezone(tz)
+    clock = format_speakable_clock(now_local)
     location_label = location.strip() if location and location.strip() else "unknown"
 
-    return (
-        f"- Current UTC time: {now_utc.isoformat()}\n"
-        f"- Current local time: {now_local.isoformat()}\n"
-        f"- Timezone: {timezone_label}\n"
-        f"- Location: {location_label}"
-    )
+    lines = [f"- Clock: {clock}"]
+    if timezone_name:
+        lines.append(f"- Timezone reference: {timezone_name}")
+    if location_label != "unknown":
+        lines.append(f"- Location reference: {location_label}")
+    return "\n".join(lines)
 
 
 def format_window_timeline(events: list[WindowSnapshot], max_segments: int = 80) -> str:

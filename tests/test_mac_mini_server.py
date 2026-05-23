@@ -275,8 +275,8 @@ class TimelinePromptTests(unittest.TestCase):
         )
 
         self.assertIn("Current context:", prompt)
-        self.assertIn("Timezone: America/Los_Angeles", prompt)
-        self.assertIn("Location: unknown", prompt)
+        self.assertIn("Clock:", prompt)
+        self.assertIn("Timezone reference: America/Los_Angeles", prompt)
         self.assertIn("User question:\nwhat was I doing?", prompt)
         self.assertIn("Recent raw window timeline, last 30 minutes", prompt)
         self.assertIn("Safari - Ollama docs", prompt)
