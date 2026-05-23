@@ -231,4 +231,3 @@ Run tests:
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
-# watchman-agentic
