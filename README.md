@@ -141,7 +141,37 @@ PYTHONPATH=src .venv/bin/python scripts/build_hotkey_app.py
 open dist/JarvisHotkey.app
 ```
 
-`JarvisHotkey.app` is a separate accessory app. Hold `Caps Lock` to record, release to stop, then it transcribes with Apple Speech, sends the transcript to the Mac mini `/v1/ask`, and posts the finished answer as a macOS notification. It reads the same `~/.jarvis/receiver-url` file as the main app/CLI.
+`JarvisHotkey.app` is a separate accessory app. Hold `Caps Lock` to record, release to stop, then it transcribes with Apple Speech, sends the transcript to the Mac mini `/v1/ask`, speaks the answer via local Voxtral TTS, and posts the finished answer as a macOS notification. It reads the same `~/.jarvis/receiver-url` file as the main app/CLI.
+
+### Local Voxtral TTS (MacBook)
+
+Jarvis uses [Mistral Voxtral 4B TTS](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603) through the MLX build (`mlx-community/Voxtral-4B-TTS-2603-mlx-4bit`) on Apple Silicon.
+
+Install TTS dependencies and start the server (first run downloads ~2.5GB of weights):
+
+```sh
+uv sync
+chmod +x scripts/start_voxtral_tts.sh
+./scripts/start_voxtral_tts.sh
+```
+
+The server listens on `http://127.0.0.1:28766` with:
+
+- `GET /health`
+- `POST /v1/speak` — JSON `{"text": "...", "voice": "neutral_male"}` → `audio/wav`
+- `POST /v1/speak/stream` — same JSON, chunked PCM (`pcm_s16le` 24 kHz mono) for low-latency playback
+
+Jarvis defaults to the English **`neutral_male`** preset (Mistral’s calm male “Paul”-style voice on the [model card](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603)).
+
+Optional overrides:
+
+```sh
+mkdir -p ~/.jarvis
+printf "%s\n" "http://127.0.0.1:28766/v1/speak/stream" > ~/.jarvis/tts-url
+printf "%s\n" "neutral_male" > ~/.jarvis/tts-voice
+```
+
+Other English presets: `casual_male`, `casual_female`, `cheerful_female`, `neutral_female`.
 
 Permissions needed on first run:
 

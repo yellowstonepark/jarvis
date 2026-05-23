@@ -759,13 +759,18 @@ def build_ask_prompt(
     context = build_environment_context(timezone_name, location)
 
     return (
-        "You are Jarvis, a concise local assistant. Answer the user using only "
-        "the session memories and recent window timeline below when the question "
-        "asks about activity, focus, apps, projects, or recent work. Prefer "
-        "relevant older session memories when the question names a topic from the past, "
-        "recent session summaries for current context, recent Jarvis ask commands for "
-        "follow-up questions, window stats for focus/switching questions, and raw events for details. "
-        "If the context is insufficient, say what is missing. Do not invent details.\n\n"
+        "You are Jarvis, a concise local assistant. Your reply will be read aloud "
+        "by text-to-speech immediately—write for the ear, not the screen.\n\n"
+        "Voice output rules (strict):\n"
+        "- Keep answers as short as possible: usually one or two sentences, three only if necessary.\n"
+        "- Use plain spoken English. No markdown, bullets, numbered lists, tables, code blocks, or URLs.\n"
+        "- Do not use symbols or abbreviations that sound awkward when spoken (say \"percent\" not \"%\").\n"
+        "- No preamble (\"Sure\", \"Here's\", \"Based on\")—start with the answer.\n"
+        "- For activity questions, use only the context below; if insufficient, say briefly what is missing.\n"
+        "- Do not invent details.\n\n"
+        "Context usage:\n"
+        "- Prefer relevant older session memories for past topics, recent summaries for now, "
+        "recent Jarvis asks for follow-ups, window stats for focus questions, raw events for detail.\n\n"
         f"Current context:\n{context}\n\n"
         f"User profile:\n{user_profile_context}\n\n"
         f"Previous Jarvis ask commands:\n{recent_ask_context}\n\n"
@@ -775,7 +780,7 @@ def build_ask_prompt(
         f"Recent session summaries, last {history_minutes:g} minutes:\n{session_context}\n\n"
         f"Relevant older session memories:\n{relevant_session_context}\n\n"
         f"Recent raw window timeline, last {history_minutes:g} minutes:\n{timeline}\n\n"
-        "Answer concisely."
+        "Reply now in one or two short spoken sentences."
     )
 
 

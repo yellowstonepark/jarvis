@@ -6,9 +6,18 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 
+dependencies = [
+    "mlx-audio>=0.2.9",
+    "mistral-common[audio]>=1.10.0",
+    "numpy",
+    "scipy",
+    "soundfile",
+]
+
 [project.scripts]
 jarvis = "jarvis.mac_agent.cli:main"
 jarvis-mini = "jarvis.mac_mini.server:main"
+jarvis-tts = "jarvis.tts_server:main"
 
 [build-system]
 requires = ["setuptools>=68"]
